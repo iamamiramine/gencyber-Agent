@@ -1,0 +1,11 @@
+name: default agentic workflow
+
+agents:
+  - name: generative
+    config_path: config/agents/generative_agent_config.yaml
+  - name: reasoning
+    config_path: config/agents/reasoning_agent_config.yaml
+  - name: pm
+    config_path: config/agents/pm_agent_config.yaml
+  - name: recon
+    config_path: config/agents/recon_agent_config.yaml

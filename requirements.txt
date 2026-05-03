@@ -1,0 +1,37 @@
+fastapi[all]
+requests
+
+aiohttp
+
+pypdf
+rank_bm25
+
+chromadb
+
+langchain>=0.1.0
+langchain-core>=0.1.10
+langchain_chroma
+langchain-community>=0.0.10
+langchain-huggingface
+langchain-openai
+langchain-ollama
+
+langsmith>=0.0.63
+
+langgraph>=0.0.10
+langgraph-checkpoint-mongodb
+langgraph-store-mongodb
+
+
+websockets>=10.0,<12.0
+
+python-dotenv>=1.0.0
+feedparser
+bs4
+
+retry
+python-socketio[asyncio-client]>=5.0.0
+
+# transformers==4.46.*
+# accelerate==1.0.*
+# bitsandbytes==0.44.*
