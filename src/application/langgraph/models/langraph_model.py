@@ -61,6 +61,7 @@ class WorkflowGraph:
         reasoning_agent: Callable[..., Any],
         generative_agent: Callable[..., Any],
         execute_script_tool: Callable[..., Any],
+        write_script_tool: Callable[..., Any],
     ) -> None:
         self.session_id = session_id
         self.reasoning_cycle_max = _DEFAULT_REASONING_CYCLE_MAX
@@ -71,6 +72,7 @@ class WorkflowGraph:
         self._reasoning = reasoning_agent
         self._generative = generative_agent
         self._execute_script = execute_script_tool
+        self._write_script = write_script_tool
 
         self.graph = self.create_graph()
 
@@ -97,6 +99,9 @@ class WorkflowGraph:
             return "end"
         if bool(s.get("should_stop")):
             return "end"
+        ws = s.get("write_script")
+        if ws is not None and str(ws).strip():
+            return "write_script"
         cmd = s.get("command")
         if cmd is not None and str(cmd).strip():
             return "script"
@@ -119,6 +124,7 @@ class WorkflowGraph:
         workflow.add_node("reasoning", self._reasoning)
         workflow.add_node("generative", self._generative)
         workflow.add_node("execute_script_tool", self._execute_script)
+        workflow.add_node("write_script_tool", self._write_script)
 
         workflow.add_edge(START, "pm")
         workflow.add_edge("pm", "recon")
@@ -133,6 +139,7 @@ class WorkflowGraph:
             "generative",
             self._route_after_generation,
             {
+                "write_script": "write_script_tool",
                 "script": "execute_script_tool",
                 "follow_up": "reasoning",
                 "end": END,
@@ -142,6 +149,11 @@ class WorkflowGraph:
         # before reasoning / generative plan the next step.
         workflow.add_conditional_edges(
             "execute_script_tool",
+            self._route_after_script,
+            {"continue": "recon", "end": END},
+        )
+        workflow.add_conditional_edges(
+            "write_script_tool",
             self._route_after_script,
             {"continue": "recon", "end": END},
         )
@@ -164,6 +176,8 @@ class WorkflowGraph:
             "should_stop": False,
             "submitted_goal": None,
             "command": None,
+            "write_script": None,
+            "write_script_language": None,
             "script_output": None,
             "generative_agent_response": None,
             "query_to_process": None,

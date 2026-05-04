@@ -6,6 +6,7 @@ import logging
 from typing import Any, AsyncIterator, Dict, Iterator, Optional
 
 from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.runnables import RunnableLambda
 
 from application.langgraph.helpers.langraph_helpers import (
     build_chain,
@@ -17,6 +18,7 @@ from application.langgraph.helpers.langraph_helpers import (
 from application.langgraph.models.langraph_model import WorkflowGraph
 from core.helpers.chat_history_helper import ChatHistoryFormatter
 from core.tools.script_execution_tool import ExecuteScriptTool
+from core.tools.write_script_tool import WriteScriptTool
 from domain.models.langchain.langchain_models import LoadModelParameters, PipelineParameters
 from domain.models.langgraph.agents_models import AgentRuntime
 
@@ -436,13 +438,15 @@ class LangGraphService:
         if self.session_id is None:
             raise ValueError("session_id must be set before building workflow")
 
+        sid = self.session_id
         self.workflow = WorkflowGraph(
-            session_id=self.session_id,
+            session_id=sid,
             pm_agent=self.agents["pm"].agent,
             recon_agent=self.agents["recon"].agent,
             reasoning_agent=self.agents["reasoning"].agent,
             generative_agent=self.agents["generative"].agent,
-            execute_script_tool=ExecuteScriptTool(session_id=self.session_id),
+            execute_script_tool=ExecuteScriptTool(session_id=sid),
+            write_script_tool=RunnableLambda(lambda state: WriteScriptTool(sid)(state)),
         )
 
     def _resolve_chat_history(self, config) -> ChatMessageHistory:

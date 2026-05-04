@@ -29,6 +29,8 @@ class GenerativeAgentState(TypedDict, total=False):
     query_to_process: Annotated[str | None, "generative_agent"]
     generative_agent_response: Annotated[str | None, "graph"]
     command: Annotated[str | None, "generative_agent"]
+    write_script: Annotated[str | None, "generative_agent"]
+    write_script_language: Annotated[str | None, "generative_agent"]
     submitted_goal: Annotated[str | None, "generative_agent"]
     should_stop: Annotated[bool | None, "generative_agent"]
     session_id: Annotated[str | None, "system"]
@@ -150,6 +152,8 @@ class GenerativeAgent(BaseStatefulAgent):
                     label="terminal output",
                 )
                 updates["command"] = None
+                updates["write_script"] = None
+                updates["write_script_language"] = None
             else:
                 self.clear_chat_history_except_persistent()
                 query_to_process = truncate_middle(
@@ -195,14 +199,33 @@ class GenerativeAgent(BaseStatefulAgent):
                 updates["generative_agent_response"] = str(structured_response)
 
             sg = structured_response.submitted_goal
+            ws = getattr(structured_response, "write_script", None)
             if sg is not None and str(sg).strip():
                 submitted = str(sg).strip()
                 updates["command"] = None
+                updates["write_script"] = None
+                updates["write_script_language"] = None
                 updates["submitted_goal"] = submitted
                 updates["should_stop"] = True
                 self.chat_history.add_ai_message(
                     AIMessage(content=f"Submitted goal: {submitted}")
                 )
+            elif ws is not None and str(ws).strip():
+                lang = getattr(structured_response, "write_script_language", None)
+                updates["write_script"] = str(ws).strip()
+                updates["write_script_language"] = (str(lang).strip() if lang else None) or "py"
+                updates["command"] = None
+                updates["submitted_goal"] = None
+                updates["should_stop"] = False
+                preview = updates["write_script"][:200] + ("…" if len(updates["write_script"]) > 200 else "")
+                self.chat_history.add_ai_message(
+                    AIMessage(
+                        content=f"Write script ({updates['write_script_language']}): {preview}"
+                    )
+                )
+                if structured_response.reasoning:
+                    reasoning_content = " | ".join(structured_response.reasoning)
+                    self.chat_history.add_ai_message(AIMessage(content=f"Reasoning: {reasoning_content}"))
             else:
                 cmd = structured_response.command
                 if cmd:
@@ -211,12 +234,15 @@ class GenerativeAgent(BaseStatefulAgent):
                     reasoning_content = " | ".join(structured_response.reasoning)
                     self.chat_history.add_ai_message(AIMessage(content=f"Reasoning: {reasoning_content}"))
                 updates["command"] = cmd
+                updates["write_script"] = None
+                updates["write_script_language"] = None
                 updates["should_stop"] = False
                 updates["submitted_goal"] = None
 
             print(
                 f"GENERATIVE_AGENT_RESPONSE should_stop={updates.get('should_stop')} "
-                f"submitted_goal={updates.get('submitted_goal')!r} command={updates.get('command')!r}",
+                f"submitted_goal={updates.get('submitted_goal')!r} command={updates.get('command')!r} "
+                f"write_script_len={len(updates.get('write_script') or '')}",
                 flush=True,
             )
 
@@ -226,6 +252,13 @@ class GenerativeAgent(BaseStatefulAgent):
                     structured_output = {
                         "type": "submitted_goal",
                         "submitted_goal": updates.get("submitted_goal"),
+                        "reasoning": structured_response.reasoning,
+                        "ethical": structured_response.ethical,
+                    }
+                elif updates.get("write_script"):
+                    structured_output = {
+                        "type": "write_script",
+                        "write_script_language": updates.get("write_script_language"),
                         "reasoning": structured_response.reasoning,
                         "ethical": structured_response.ethical,
                     }
