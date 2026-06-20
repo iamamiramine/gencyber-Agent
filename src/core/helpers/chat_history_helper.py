@@ -4,8 +4,6 @@ from langchain_core.prompts.chat import (
     AIMessage,
 )
 
-from core.helpers.llm_context_limits import max_chat_history_chars, truncate_middle
-
 
 class ChatHistoryFormatter:
     """Centralized chat history formatter for different model types."""
@@ -36,9 +34,7 @@ class ChatHistoryFormatter:
             if not isinstance(content, str):
                 content = str(content)
 
-            if model_name == "gpt-4o-mini":
-                formatted_history += f"{role}\n{content}\n"
-            elif model_name == "gpt-4.1-mini":
+            if "gpt" in model_name.lower():
                 formatted_history += f"{role}\n{content}\n"
             elif model_name == "WhiteRabbit-Qwen":
                 formatted_history += f"<|im_start|>{role}\n{content}<|im_end|>\n"
@@ -48,9 +44,4 @@ class ChatHistoryFormatter:
                 # Default formatting for unknown models
                 formatted_history += f"{role}\n{content}\n"
 
-        cap = max_chat_history_chars()
-        if len(formatted_history) > cap:
-            formatted_history = truncate_middle(
-                formatted_history, cap, label="earlier chat history"
-            )
         return formatted_history

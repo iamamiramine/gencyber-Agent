@@ -21,7 +21,9 @@ from core.tools.script_execution_tool import _compose_script_output_for_agent
 
 logger = logging.getLogger(__name__)
 
-SCRIPT_DIR = "/workspace/.gencyber-agent-scripts"
+SCRIPT_DIR = os.getenv(
+    "GENCYBER_AGENT_SCRIPT_DIR", "/workspace/.gencyber-agent-scripts"
+)
 MARKER_PREFIX = "# gencyber-agent-managed"
 MARKER_TOKEN = "gencyber"
 _MAX_BYTES = 262144
@@ -68,8 +70,8 @@ def _remote_write_command(remote_path: str, raw_bytes: bytes) -> str:
 
 class WriteScriptTool:
     """
-    Same role as ``ExecuteScriptTool``: used as a LangGraph node callable; writes via
-    ``execute_in_terminal_session`` so files land on the workbench volume.
+    LangGraph node callable: writes via ``execute_in_terminal_session`` so files land
+    on the workbench volume.
     """
 
     name: str = "write_script"
@@ -132,7 +134,8 @@ class WriteScriptTool:
             f"- path: ``{remote_path}``\n"
             f"- script-id: ``{script_id}``\n"
             f"- Next turn: set ``command`` to run it, e.g. "
-            f"``python3 {remote_path}`` or ``bash {remote_path}`` (not a one-liner ``python3 -c`` for long logic).\n"
+            f"``python3 {remote_path}`` or ``bash {remote_path}`` (not a one-liner "
+            f"``python3 -c`` for long logic).\n"
             f"\n--- remote write stdout/stderr ---\n{out}{chmod}"
         )
         print(
@@ -145,4 +148,3 @@ class WriteScriptTool:
             "write_script_language": None,
             "command": None,
         }
-

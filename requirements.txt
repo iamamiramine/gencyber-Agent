@@ -32,6 +32,11 @@ bs4
 retry
 python-socketio[asyncio-client]>=5.0.0
 
+# Web/OSINT recon (optional, best-effort): DuckDuckGo search + HTML-to-text.
+# The recon toolkit also auto-detects CAMEL (`camel-ai`) if installed.
+ddgs
+html2text
+
 # transformers==4.46.*
 # accelerate==1.0.*
 # bitsandbytes==0.44.*

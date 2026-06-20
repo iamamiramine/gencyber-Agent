@@ -66,6 +66,9 @@ class PipelineConfigService:
             "model_config_raw": model_config_raw,
             "history_keys": sorted(history_keys),
             "registry_agents": agent_entries,
+            # Optional ``graph:`` key selects the graph builder (GRAPH_REGISTRY).
+            # ``None`` → the single-agent BaselineWorkflow.
+            "graph": registry.get("graph"),
         }
 
     def list_pipeline_registries(self) -> List[Dict[str, Any]]:

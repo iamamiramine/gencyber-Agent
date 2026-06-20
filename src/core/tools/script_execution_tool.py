@@ -1,95 +1,90 @@
-from langchain.tools import BaseTool
-from typing import Optional, Type, Dict, Any, List
-from pydantic import BaseModel, Field, model_validator
+"""Run shell commands in the workbench shared PTY (HTTP).
+
+Faithful to the gencyber-0 baseline: the tool dispatches the agent's command and
+returns the raw terminal output as ``script_output``. It does NOT interpret,
+summarize, or annotate output — the agent reads the raw text and infers what
+happened. The workbench PTY merges stderr into the same stream as stdout, so
+``stdout`` already carries the full terminal output; we only fall back to the
+``stderr`` field for infrastructure-level errors (HTTP / transport failures) where
+stdout is empty, so such a failure is never a silent blank turn.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
 
 from core.helpers.terminal_session_client import execute_in_terminal_session
 
 
 def _compose_script_output_for_agent(result: Dict[str, Any]) -> str:
+    """Return the raw terminal output, faithful to gencyber-0 (stdout only).
+
+    No interpretation, no exit/cwd annotation. Because the workbench PTY folds
+    stderr into the stdout stream, ``stdout`` is the complete terminal output. The
+    only fallback is an infrastructure error reported on ``stderr`` while stdout is
+    empty (e.g. the HTTP call to the workbench failed).
     """
-    Merge stdout, stderr, and exit metadata so downstream agents see failures
-    (curl and many tools write errors to stderr only).
-    """
-    chunks: List[str] = []
-    stdout = (result.get("stdout") or "").strip()
-    stderr = (result.get("stderr") or "").strip()
+    stdout = result.get("stdout")
     if stdout:
-        chunks.append(stdout)
+        return stdout
+    stderr = result.get("stderr")
     if stderr:
-        chunks.append("[stderr]\n" + stderr)
-    exit_code = result.get("exit_code")
-    success = result.get("success")
-    meta: List[str] = []
-    if exit_code is not None:
-        meta.append(f"exit_code={exit_code}")
-    if success is False:
-        meta.append("success=false")
-    if meta:
-        chunks.append("[" + " ".join(meta) + "]")
-    if not chunks:
-        return "(no output)"
-    return "\n\n".join(chunks)
+        return stderr
+    return ""
 
-class ScriptExecutionInput(BaseModel):
-    """Input for ExecuteScriptTool."""
-    command: Optional[str] = Field(default=None, description="The command to execute")
-    timeout: Optional[int] = Field(default=60, description="Timeout in seconds for command execution")
-    
-    @model_validator(mode="after")
-    def validate_and_set_command(self) -> "ScriptExecutionInput":
-        """Validate that command is provided and set command if missing."""
-        if self.command is None:
-            raise ValueError("'command' field must be provided")
-        return self
 
-class ExecuteScriptTool(BaseTool):
-    """Run shell commands in the workbench terminal-session (PTY over HTTP)."""
+# Public alias for tests / write_script_tool.
+compose_script_output_for_agent = _compose_script_output_for_agent
+
+
+class ExecuteScriptTool:
+    """LangGraph node callable: run ``state['command']`` in the workbench PTY."""
 
     name: str = "execute_script"
-    description: str = (
-        "Execute a shell command in the shared workbench terminal and return stdout/stderr. "
-        "Uses ``TERMINAL_SESSION_URL`` and the graph session id."
-    )
-    args_schema: Type[BaseModel] = ScriptExecutionInput
     session_id: str = "default"
+    default_timeout: int = 60
 
-    def __init__(self, session_id: str = "default"):
-        """Initialize with the terminal session id (align with UI / thread)."""
-        super().__init__()
+    def __init__(self, session_id: str = "default", timeout: int = 60) -> None:
         self.session_id = session_id
-    
-    def _run(self, command: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
-        """Execute a shell command and return its output.
-        
-        Args:
-            command (str, optional): The command to execute.
-            timeout (int, optional): Timeout in seconds. Defaults to 60.
-            
-        Returns:
-            Dict[str, Any]: Dictionary with execution results to update the graph state
-        """            
+        self.default_timeout = timeout
+
+    def _run(self, command: str, timeout: int | None = None) -> Dict[str, Any]:
+        """Execute a shell command and return graph state updates."""
+        timeout = self.default_timeout if timeout is None else timeout
         try:
-            # Sync HTTP — safe inside LangGraph ``astream_events`` / async FastAPI (no asyncio.run).
             result = execute_in_terminal_session(
-                command=command or "",
+                command=command,
                 session_id=self.session_id,
                 timeout=timeout,
             )
-
-            return_dict = {
-                "script_output": _compose_script_output_for_agent(result),
-            }
-
-            out_preview = (return_dict.get("script_output") or "")[:500]
+            text = _compose_script_output_for_agent(result)
+            # SSH-exit hint, faithful to gencyber-0: when the agent leaves an SSH
+            # session, remind it that it is back at the local terminal.
+            if command and command.strip().lower() == "exit":
+                text = (
+                    text
+                    + "\n\nYou have exited the SSH session and are now at the local "
+                    "terminal. Output your next command to continue the task."
+                )
             print(
-                f"EXECUTE_SCRIPT_TOOL command={command!r} stdout_preview_len={len(out_preview)}",
+                f"EXECUTE_SCRIPT_TOOL command={command!r} stdout_preview_len={len(text[:500])}",
                 flush=True,
             )
-            return return_dict
-            
+            return {"script_output": text, "command": None}
         except Exception as e:
-            error_msg = f"An unexpected error occurred: {e}"
             print(f"EXECUTE_SCRIPT_TOOL error={e!r}", flush=True)
             return {
-                "script_output": error_msg,
+                "script_output": f"An unexpected error occurred: {e}",
+                "command": None,
             }
+
+    def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        command = (state.get("command") or "").strip()
+        if not command:
+            return {
+                "script_output": "[execute_script] No ``command`` in state.",
+                "command": None,
+            }
+        explicit = state.get("command_timeout")
+        timeout = int(explicit) if explicit is not None else None
+        return self._run(command, timeout=timeout)

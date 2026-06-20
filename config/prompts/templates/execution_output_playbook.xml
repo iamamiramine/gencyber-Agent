@@ -1,0 +1,26 @@
+<!-- ==================== EXECUTION OUTPUT & PTY ==================== -->
+
+<Playbook name="ExecutionOutput">
+Description:
+How to read terminal output from ``execute_script`` / ``write_script`` and optional env tuning.
+
+Terminal format:
+- Output merges **stdout**, then **[stderr]** if present, then metadata like ``[exit_code=N]``.
+- ``exit_code=0`` means success; any other code is a real failure — diagnose before retrying.
+- ``[running=true]`` or ``[timed_out=true]`` means the command may still be running in the **shared PTY**; do not assume success from partial output.
+- ``(no output)`` means the command produced nothing visible.
+
+Timeouts (optional env):
+- ``GENCYBER_DEFAULT_CMD_TIMEOUT`` — default seconds for ordinary commands (often 60).
+- ``GENCYBER_LONG_CMD_TIMEOUT`` — use a higher budget yourself for long scans (nmap, gobuster, hashcat, etc.) by keeping the command focused or splitting work; the tool default is the short timeout unless you pass ``command_timeout`` in state.
+- ``GENCYBER_WRITE_SCRIPT_TIMEOUT`` — max seconds for the remote write step (default 120).
+
+Scripts on disk:
+- ``write_script`` saves under ``GENCYBER_AGENT_SCRIPT_DIR`` (default ``/workspace/.gencyber-agent-scripts``).
+- Supported extensions: ``py``, ``sh``, ``bash`` (and similar short names). Next turn: ``command`` = ``python3 /path/to/file.py`` or ``bash /path/to/file.sh``.
+- Never use a giant ``python3 -c '...'`` one-liner for multi-line logic — use ``write_script`` then run the saved path.
+
+Shared shell:
+- One persistent PTY per session; cwd and env persist across turns.
+- If a prior command failed, change approach (fix paths, permissions, syntax) — do not repeat the same failing command unchanged.
+</Playbook>

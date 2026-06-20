@@ -1,0 +1,24 @@
+<ToolsOverview>
+<!--
+  Quick reference for the tools and overlays this agent actually has. Lives in the
+  per-agent playbook so the system prompt stays role-only.
+-->
+
+<WriteScriptTool>
+You have a **dedicated tool for writing files** — `write_script`. Emit it the same way you emit `command`, but put the full file body in `write_script` (and the language / extension in `write_script_language`, e.g. `py`, `sh`, `bash`).
+
+Use `write_script` when you need to create or replace a file. **Do NOT** hand-roll inline file writes via shell heredocs, `python3 -c 'open(...).write(...)'`, or base64-encoded one-liners. Those approaches break on quoting, on binary content, on long scripts, and on shells that interpret your delimiters. `write_script` handles atomicity, paths, watermarks, and binary safety for you, then returns the absolute path of the saved file in the next observation.
+
+Workflow:
+  1. Turn N: emit `write_script` with the body + `write_script_language`. Leave `command` null.
+  2. Turn N+1: the user message shows something like `[saved] /workspace/.gencyber-agent-scripts/<id>.py`. Read that absolute path and, in the SAME turn, emit `command` to execute it — `python3 <saved_path>`, `bash <saved_path>`, etc.
+
+Reach for `write_script` whenever the script body is more than ~3 lines, contains quotes/backslashes/binary, or is going to be reused across multiple commands.
+</WriteScriptTool>
+
+<ObservationContract>
+Each observation is the **raw terminal output** of the command you just ran — exactly what the persistent shell printed, with no interpretation, summary, or annotation added by the tool. The shell is a PTY, so a command's error text appears inline in the same stream as its normal output; there is no separate stderr block to look for.
+
+Because the tool tells you nothing, YOU read the raw text and infer what happened: whether the command succeeded, what a binary printed, why something failed (e.g. a `No such file or directory` or syntax-error line). The shell session is persistent — its working directory and environment carry over between turns — so prefer absolute paths in the commands you emit to avoid a whole class of "file not found" failures, and `cd` explicitly when you need to move. If an observation is empty or unexpected, treat that as a clue (the command may write to a file, read stdin, or need different arguments), not a dead end.
+</ObservationContract>
+</ToolsOverview>

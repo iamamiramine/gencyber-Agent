@@ -4,22 +4,20 @@ import logging
 import os
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Annotated, Any, Callable, Dict, TypedDict
+from typing import Annotated, Any, Callable, Dict, Optional, TypedDict
 
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.generative_agent import GenerativeAgentState
-from core.agents.pm_agent import PMAgentState
 from core.agents.reasoning_agent import ReasoningAgentState
-from core.agents.recon_agent import ReconAgentState
 from infrastructure.repository.mongodb_repository import get_mongodb_client
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_REASONING_CYCLE_MAX = 50
-_DEFAULT_RECURSION_LIMIT = 100
+_DEFAULT_GENERATION_CYCLE_MAX = 60
+_DEFAULT_RECURSION_LIMIT = 300
 
 
 def _routing_state_view(state: Any) -> Dict[str, Any]:
@@ -30,6 +28,46 @@ def _routing_state_view(state: Any) -> Dict[str, Any]:
     return dict(state)
 
 
+def serialize_graph_topology(compiled: Any) -> Dict[str, Any]:
+    """Project a compiled LangGraph into a JSON-able ``{nodes, edges, ...}`` shape.
+
+    Reads ``compiled.get_graph()`` directly so callers never hand-maintain a
+    duplicate of the wiring. Conditional-branch keys (``edge.data``) become edge
+    labels; the synthetic ``__start__`` / ``__end__`` ids are preserved as-is so
+    the frontend can normalize them.
+    """
+    drawable = compiled.get_graph()
+
+    nodes = [{"id": str(node_id)} for node_id in drawable.nodes]
+
+    edges: list[Dict[str, Any]] = []
+    entry: Optional[str] = None
+    for edge in drawable.edges:
+        source = str(edge.source)
+        target = str(edge.target)
+        data = getattr(edge, "data", None)
+        label = str(data) if isinstance(data, str) and data.strip() else None
+        conditional = bool(getattr(edge, "conditional", False))
+        edges.append(
+            {
+                "source": source,
+                "target": target,
+                "label": label,
+                "conditional": conditional,
+            }
+        )
+        if source == "__start__" and entry is None:
+            entry = target
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "entry": entry,
+        "start": "__start__",
+        "end": "__end__",
+    }
+
+
 class WorkflowGraphMetadata(TypedDict, total=False):
     """Run-level keys (optional, ``TypedDict``)."""
 
@@ -37,143 +75,173 @@ class WorkflowGraphMetadata(TypedDict, total=False):
     created_at: Annotated[datetime | None, "system"]
     error: Annotated[str | None, "system"]
     generated_response: Annotated[str | None, "system"]
+    submission_verified: Annotated[bool | None, "system"]
+    submission_rejection_reason: Annotated[str | None, "system"]
 
 
 class WorkflowGraphState(
-    PMAgentState,
-    ReconAgentState,
-    ReasoningAgentState,
     GenerativeAgentState,
     WorkflowGraphMetadata,
     total=False,
 ):
-    """Merged channel schema for ``StateGraph`` (same keys as agent slices + metadata)."""
+    """Merged channel schema for the single-agent ``StateGraph``."""
 
 class WorkflowGraph:
-    """Workflow graph with explicit edges (no YAML topology parsing)."""
+    """Single generative agent + execute_script / write_script / submit_goal tools."""
+
+    # Agents (by registry name) this builder needs from the pipeline registry. The
+    # service validates these are present and passes their runtimes to ``build``.
+    REQUIRED_AGENTS: frozenset = frozenset({"generative"})
 
     def __init__(
         self,
         session_id: str,
         *,
-        pm_agent: Callable[..., Any],
-        recon_agent: Callable[..., Any],
-        reasoning_agent: Callable[..., Any],
         generative_agent: Callable[..., Any],
         execute_script_tool: Callable[..., Any],
         write_script_tool: Callable[..., Any],
+        submit_goal_tool: Callable[..., Any],
+        checkpointing: bool = True,
     ) -> None:
         self.session_id = session_id
-        self.reasoning_cycle_max = _DEFAULT_REASONING_CYCLE_MAX
+        self.generation_cycle_max = _DEFAULT_GENERATION_CYCLE_MAX
         self.recursion_limit = _DEFAULT_RECURSION_LIMIT
+        # When False the graph compiles without a MongoDB checkpointer — used for
+        # cheap, side-effect-free topology serialization (see ``topology``).
+        self._checkpointing = checkpointing
 
-        self._pm = pm_agent
-        self._recon = recon_agent
-        self._reasoning = reasoning_agent
         self._generative = generative_agent
         self._execute_script = execute_script_tool
         self._write_script = write_script_tool
+        self._submit_goal = submit_goal_tool
 
         self.graph = self.create_graph()
 
-    def _route_after_reasoning(self, state: Dict[str, Any]) -> str:
-        s = _routing_state_view(state)
-        sg = s.get("submitted_goal")
-        if sg is not None and str(sg).strip():
-            return "end"
-        if bool(s.get("should_stop")):
-            return "end"
-        cycle_count = int(s.get("reasoning_cycle_count") or 0)
-        if cycle_count > self.reasoning_cycle_max:
-            logger.warning(
-                "Reasoning cycle limit reached (max=%s); routing to end",
-                self.reasoning_cycle_max,
-            )
-            return "end"
-        return "continue"
-
     def _route_after_generation(self, state: Dict[str, Any]) -> str:
         s = _routing_state_view(state)
+        if bool(s.get("submission_verified")):
+            return "end"
         sg = s.get("submitted_goal")
         if sg is not None and str(sg).strip():
-            return "end"
-        if bool(s.get("should_stop")):
-            return "end"
+            return "submit_goal"
         ws = s.get("write_script")
         if ws is not None and str(ws).strip():
             return "write_script"
         cmd = s.get("command")
         if cmd is not None and str(cmd).strip():
             return "script"
-        return "follow_up"
+        # No actionable output — but the run does NOT end here. Loop back so the agent
+        # tries again; only a verified submission ends the run.
+        return "continue"
 
-    def _route_after_script(self, state: Dict[str, Any]) -> str:
+    def _route_after_submit(self, state: Dict[str, Any]) -> str:
         s = _routing_state_view(state)
-        sg = s.get("submitted_goal")
-        if sg is not None and str(sg).strip():
-            return "end"
-        if bool(s.get("should_stop")):
+        if bool(s.get("submission_verified")):
             return "end"
         return "continue"
 
-    def create_graph(self) -> StateGraph:
+    def _wire_state_graph(self) -> StateGraph:
+        """Wire nodes/edges of the (uncompiled) ``StateGraph``.
+
+        Topology lives here so both the live graph and ``topology`` serialization
+        share one source of truth — there is no hand-maintained duplicate.
+        """
         workflow = StateGraph(WorkflowGraphState)
 
-        workflow.add_node("pm", self._pm)
-        workflow.add_node("recon", self._recon)
-        workflow.add_node("reasoning", self._reasoning)
         workflow.add_node("generative", self._generative)
         workflow.add_node("execute_script_tool", self._execute_script)
         workflow.add_node("write_script_tool", self._write_script)
+        workflow.add_node("submit_goal_tool", self._submit_goal)
 
-        workflow.add_edge(START, "pm")
-        workflow.add_edge("pm", "recon")
-        workflow.add_edge("recon", "reasoning")
-
-        workflow.add_conditional_edges(
-            "reasoning",
-            self._route_after_reasoning,
-            {"continue": "generative", "end": END},
-        )
+        workflow.add_edge(START, "generative")
         workflow.add_conditional_edges(
             "generative",
             self._route_after_generation,
             {
                 "write_script": "write_script_tool",
                 "script": "execute_script_tool",
-                "follow_up": "reasoning",
+                "submit_goal": "submit_goal_tool",
+                "continue": "generative",
                 "end": END,
             },
         )
-        # Re-run recon after every command so environmental context reflects the latest output
-        # before reasoning / generative plan the next step.
         workflow.add_conditional_edges(
-            "execute_script_tool",
-            self._route_after_script,
-            {"continue": "recon", "end": END},
+            "submit_goal_tool",
+            self._route_after_submit,
+            {"continue": "generative", "end": END},
         )
-        workflow.add_conditional_edges(
-            "write_script_tool",
-            self._route_after_script,
-            {"continue": "recon", "end": END},
-        )
+        workflow.add_edge("execute_script_tool", "generative")
+        workflow.add_edge("write_script_tool", "generative")
+        return workflow
+
+    def create_graph(self) -> Any:
+        workflow = self._wire_state_graph()
+
+        # Topology-only callers compile without a checkpointer so no MongoDB
+        # connection (and no run-time side effects) are needed.
+        if not self._checkpointing:
+            return workflow.compile()
+
         mongo_client = get_mongodb_client()
         db_name = os.getenv("MONGODB_DATABASE", "gencyber")
         checkpointer = MongoDBSaver(mongo_client, db_name=db_name)
 
         return workflow.compile(checkpointer=checkpointer)
 
+    @classmethod
+    def topology(cls) -> Dict[str, Any]:
+        """Serialize the real compiled graph shape (no MongoDB, no side effects).
+
+        Builds an instance with no-op node callables and ``checkpointing=False``
+        so we can read the actual ``compiled.get_graph()`` — the viz therefore
+        reflects whatever ``_wire_state_graph`` wires, with no duplicate map.
+        """
+
+        def _noop(state: Any) -> Any:
+            return state
+
+        inst = cls(
+            session_id="__topology__",
+            generative_agent=_noop,
+            execute_script_tool=_noop,
+            write_script_tool=_noop,
+            submit_goal_tool=_noop,
+            checkpointing=False,
+        )
+        return serialize_graph_topology(inst.graph)
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        session_id: str,
+        agents: Dict[str, Any],
+        execute_script_tool: Callable[..., Any],
+        write_script_tool: Callable[..., Any],
+        submit_goal_tool: Callable[..., Any],
+    ) -> "WorkflowGraph":
+        """Construct the live graph from resolved agent runtimes + tool callables.
+
+        Lets the service stay graph-agnostic: it validates ``REQUIRED_AGENTS`` and
+        hands every builder the same ``agents`` map and tools; each builder picks the
+        agents it needs.
+        """
+        return cls(
+            session_id=session_id,
+            generative_agent=agents["generative"],
+            execute_script_tool=execute_script_tool,
+            write_script_tool=write_script_tool,
+            submit_goal_tool=submit_goal_tool,
+        )
+
     def _build_initial_state(self, query: str) -> Dict[str, Any]:
-        """
-        Per-invoke input merged with the checkpointer for ``thread_id``.
-        """
+        """Per-invoke input merged with the checkpointer for ``thread_id``."""
         now = datetime.now()
-        state_dict = {
+        return {
             "query": query,
             "session_id": self.session_id,
             "timestamp": now,
             "created_at": now,
-            "should_stop": False,
             "submitted_goal": None,
             "command": None,
             "write_script": None,
@@ -181,24 +249,13 @@ class WorkflowGraph:
             "script_output": None,
             "generative_agent_response": None,
             "query_to_process": None,
-            # PM + recon (cleared so nothing from the previous checkpoint leaks in)
-            "objectives": [],
-            "constraints": [],
-            "goal_format": None,
-            "planning_context": None,
-            "context": None,
-            # Reasoning (must clear so a new task tree is built for this query)
-            "reasoning_task_tree": None,
-            "reasoning_candidate_tasks": [],
-            "reasoning_recommended_task": None,
-            "reasoning_initialized": False,
-            "reasoning_last_input": None,
-            "reasoning_cycle_count": 0,
-            "reasoning_agent_response": None,
+            "submission_verified": None,
+            "submission_rejection_reason": None,
         }
-        return state_dict
 
-    def invoke(self, query: str) -> Dict[str, Any]:
+    def invoke(
+        self, query: str
+    ) -> Dict[str, Any]:
         logger.info("Invoking agent graph query=%s", query)
         state_dict = self._build_initial_state(query=query)
         try:

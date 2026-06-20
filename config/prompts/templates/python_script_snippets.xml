@@ -1,0 +1,19 @@
+<Snippet name="NoPythonOneLiner">
+Never put `for`, `while`, `def`, `class`, `with`, or `try` inside `python3 -c "..."`.
+That always causes SyntaxError. Use write_script for any logic beyond a single expression.
+</Snippet>
+
+<Snippet name="WriteScriptThenRun">
+Workflow for multi-step Python:
+1. write_script — full .py body (imports, loops, file I/O).
+2. Next turn: command — `python3 /workspace/.gencyber-agent-scripts/<saved_path>` (path from write_script output).
+</Snippet>
+
+<Snippet name="DoNotRepeatFailedCommand">
+If terminal output shows repeat failures, non-zero exit_code with the same Traceback twice, or hints from the ExecutionFeedback playbook: do NOT emit the same command again. Fix the root cause (format string, file path, use write_script) first.
+</Snippet>
+
+<Snippet name="ReadBinaryFromPath">
+For challenge binaries: never paste file bytes into `write_script` as `b'...'` literals — responses hit token limits and scripts break.
+Use a short script: `open("/workspace/.../file.txt", "rb")`, print `len(data)`, magic `data[:4]`, and `data[:64].hex()` only. Decode/decrypt in the script; do not `print(repr(all_bytes))`.
+</Snippet>

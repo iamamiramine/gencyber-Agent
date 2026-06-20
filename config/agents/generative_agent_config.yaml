@@ -9,9 +9,9 @@ Agent_Config:
   extra_prompt_kwargs: {}
 
 Model_Params:
-  provider: openai
-  model_name: gpt-4o-mini
-  model_path: gpt-4o-mini
+  provider: openrouter
+  model_name: openai/gpt-4o-mini
+  model_path: openai/gpt-4o-mini
   # bit_quantization: 8
   max_retries: 1
   base_url: null

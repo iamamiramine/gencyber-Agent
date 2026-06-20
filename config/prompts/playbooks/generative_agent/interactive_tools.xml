@@ -1,0 +1,57 @@
+<InteractiveTools>
+<!--
+  Interactive Agent Tools (IATs): non-blocking REPL sessions that run ALONGSIDE
+  the persistent shell. You drive them with ordinary one-line `command:` actions
+  (one per turn, same as any shell command). Each call returns the REAL session
+  output (gdb register/stack dumps, live server replies) on the next turn — not a
+  raw socket and not a blocking prompt. Reach for these instead of piping into
+  `gdb -batch` or a one-shot `nc`, which lose all state between turns.
+
+  Only ONE interactive session may be open at a time. Always stop the current one
+  before starting a different kind.
+-->
+
+<Debugger>
+A persistent gdb session for dynamic analysis of a local executable. Typical loop:
+
+  1. `debug_start <binary> [args]` — opens gdb on the binary and stops at the first
+     instruction. (The file must be executable; `chmod +x` it first if needed.)
+  2. `debug_add_breakpoint <where>` — set a breakpoint at a function name, address
+     (e.g. `*0x401136`), or `file:line`.
+  3. `debug_continue` — run until the next breakpoint or program end.
+  4. `debug_step [n]` — single-step `n` instructions (default 1).
+  5. `debug_exec '<gdb command>'` — run ANY gdb command in the session, e.g.
+     `debug_exec 'info registers'`, `debug_exec 'x/8gx $rsp'`, `debug_exec 'print $rax'`,
+     `debug_exec 'disassemble main'`. Wrap the gdb command in single quotes so the
+     shell does not mangle `$`, `*`, or spaces.
+  6. `debug_stop` — end the session when done (frees it so you can open another).
+
+Read the returned register/memory/disassembly output to decide the next step;
+the session remembers its state across turns.
+</Debugger>
+
+<ServerConnection>
+A persistent connection to a remote service for interactive protocol work
+(banners, prompts, multi-step exploits). Loop:
+
+  1. `connect_start <host> <port>` — open the connection; the first server response
+     is returned.
+  2. `connect_sendline [line]` — send one line. Hex/byte values use `\x<hh>`
+     (e.g. `connect_sendline 'A'*40 + '\x36\x11\x40'` style payloads are written as
+     literal `\xhh` escapes). The server's reply is returned.
+  3. `connect_exec '<command>'` — run a raw REPL command if you need finer control.
+  4. `connect_stop` — close the connection.
+
+Use this for services you must talk to turn-by-turn; it keeps the socket open
+between turns instead of reconnecting each time.
+</ServerConnection>
+
+<Discipline>
+- Emit exactly one IAT command per turn, in the `command` field, like any shell command.
+- The next observation is the session's real output — reason over it before the next step.
+- If you see "Interactive session already open", run the matching `*_stop` first.
+- If you see "is not running", you must `*_start` before sending follow-up commands.
+- When you recover a credential/flag from a debugger or server reply, state it in your
+  `reasoning` and submit it via `submitted_goal` once it satisfies the objective.
+</Discipline>
+</InteractiveTools>

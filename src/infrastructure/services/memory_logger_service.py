@@ -93,7 +93,7 @@ class MemoryLogger:
                 "context": state.get("context", ""),
                 "command": state.get("command", ""),
                 "script_output": state.get("script_output", ""),
-                "should_stop": state.get("should_stop", False),
+                "submission_verified": state.get("submission_verified", False),
                 "structured_response": structured_response
             }
             
@@ -120,6 +120,51 @@ class MemoryLogger:
             
         except Exception as e:
             logger.error(f"Failed to log comprehensive memory for {agent_type}: {e}")
+            return False
+
+    def log_execution_event(self,
+                            session_id: str,
+                            command: str,
+                            result: Dict[str, Any]) -> bool:
+        """Log a single command/script execution event (audit trail).
+
+        Stored separately from agent interactions so command outcomes (exit
+        code, timeout, backgrounding) can be replayed without inflating LLM
+        context. Best-effort: never raises.
+
+        Args:
+            session_id: The session identifier.
+            command: The command that was executed.
+            result: Structured outcome (exit_code, timed_out, running, etc.).
+
+        Returns:
+            bool: True if logging was successful, False otherwise.
+        """
+        if not self.mongodb_uri:
+            return False
+        try:
+            event = {
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "command": command,
+                **(result or {}),
+            }
+            content_hash = hashlib.md5(
+                json.dumps(event, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            with MongoDBStore.from_conn_string(
+                conn_string=self.mongodb_uri,
+                db_name=self.db_name,
+                collection_name="execution_events",
+            ) as store:
+                store.put(
+                    namespace=(session_id, "execution_events"),
+                    key=f"exec_{content_hash}",
+                    value=event,
+                )
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to log execution event: {e}")
             return False
 
     def close(self):

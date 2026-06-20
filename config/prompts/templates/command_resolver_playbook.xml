@@ -1,0 +1,67 @@
+<!-- ==================== MISSING TOOLS & FALLBACKS ==================== -->
+
+<Playbook name="CommandResolver">
+Description:
+When ``command not found`` (exit 127) or a scanner/http tool is missing, use an installed alternative or a portable bash/python recipe. Check with ``command -v TOOL`` before relying on a package. Do not repeat the same missing command.
+
+Fallbacks by primary tool:
+
+nmap:
+- Try ``rustscan`` or ``masscan`` if present.
+- Bash TCP: ``for p in 22 80 443 8080; do (echo > /dev/tcp/HOST/$p) >/dev/null 2>&1 && echo "$p open"; done``
+- Python socket sweep on common ports.
+- ``nc -zv HOST 1-1024 2>&1 | grep -i succeeded``
+
+gobuster:
+- ``ffuf -w WORDLIST -u http://HOST/FUZZ`` or ``feroxbuster -u http://HOST``
+- ``dirb http://HOST WORDLIST`` or ``wfuzz``
+- curl loop over a wordlist for non-404 responses.
+
+ffuf:
+- ``gobuster dir -u http://HOST -w WORDLIST`` or ``feroxbuster``
+- curl wordlist loop (see gobuster).
+
+curl:
+- ``wget -qO- URL`` or ``wget -O FILE URL``
+- Bash ``/dev/tcp`` for simple HTTP
+- Python ``urllib.request.urlopen``
+
+wget:
+- ``curl -s URL`` or ``curl -O URL``
+- Python urllib.
+
+nc / netcat:
+- ``ncat``, ``socat``, or bash ``/dev/tcp``.
+
+dig:
+- ``nslookup HOST``, ``host HOST``, or python ``socket.gethostbyname``.
+
+nslookup:
+- ``dig HOST``, ``host HOST``, or python socket.
+
+python / python3:
+- Try the other binary or ``python3.x``.
+
+ss:
+- ``netstat -tulpn`` or read ``/proc/net/tcp``.
+
+netstat:
+- ``ss -tulpn`` or ``/proc/net/tcp``.
+
+ip:
+- ``ifconfig -a`` and ``route -n``.
+
+file:
+- ``xxd -l 64 PATH``, ``hexdump -C -n 64 PATH``
+- Python: read first bytes and print length, magic, hex prefix
+- ``head -c 64 PATH | xxd``
+
+xxd:
+- ``hexdump -C`` or short Python read.
+
+hexdump:
+- ``xxd`` or Python ``open(path,'rb').read(64).hex()``.
+
+sshpass without ssh:
+- Install client: ``apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-client`` then retry.
+</Playbook>

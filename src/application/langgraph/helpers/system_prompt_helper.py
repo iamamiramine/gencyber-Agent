@@ -46,29 +46,58 @@ def _replace_named_placeholders(template: str, values: Dict[str, Any]) -> str:
     return out
 
 
-def load_playbooks_section(base_path: str, subdir: str = "playbooks") -> str:
-    """Load and concatenate all XML files from {base_path}/prompts/playbooks (e.g. linux_playbook.xml)."""
-    root = _prompts_dir(base_path) / subdir
-    if not root.exists():
-        return ""
-    parts = []
+def _load_xml_dir(root: Path) -> list[str]:
+    """Read every ``*.xml`` file in ``root`` (non-recursive) into a list of content strings."""
+    if not root.exists() or not root.is_dir():
+        return []
+    parts: list[str] = []
     for f in sorted(root.glob("*.xml")):
         content = _read_file(f)
         if content:
             parts.append(content)
+    return parts
+
+
+def load_playbooks_section(
+    base_path: str,
+    *,
+    agent_name: Optional[str] = None,
+    subdir: str = "playbooks",
+) -> str:
+    """Load playbook XML files for this agent.
+
+    Files are sourced from two locations and concatenated in this order:
+
+      1. ``{base_path}/prompts/{subdir}/*.xml`` — **shared** playbooks loaded by every
+         agent (e.g. ``linux_playbook.xml``). Keeps backwards compatibility with the
+         original flat layout.
+      2. ``{base_path}/prompts/{subdir}/{agent_name}/*.xml`` — **per-agent** playbooks
+         that only this agent sees. Lets domain knowledge / examples / command catalogs
+         live with the agent that consumes them, instead of being baked into the system
+         prompt.
+    """
+    root = _prompts_dir(base_path) / subdir
+    parts = _load_xml_dir(root)
+    if agent_name:
+        parts.extend(_load_xml_dir(root / agent_name))
     return "\n\n".join(parts) if parts else ""
 
 
-def load_snippets_section(base_path: str, subdir: str = "snippets") -> str:
-    """Load and concatenate all XML files from {base_path}/prompts/snippets (e.g. linux_snippets.xml)."""
+def load_snippets_section(
+    base_path: str,
+    *,
+    agent_name: Optional[str] = None,
+    subdir: str = "snippets",
+) -> str:
+    """Load snippet XML files for this agent.
+
+    Same shared-then-per-agent layering as :func:`load_playbooks_section`. Shared files
+    at the root of ``{subdir}``; per-agent files under ``{subdir}/{agent_name}/``.
+    """
     root = _prompts_dir(base_path) / subdir
-    if not root.exists():
-        return ""
-    parts = []
-    for f in sorted(root.glob("*.xml")):
-        content = _read_file(f)
-        if content:
-            parts.append(content)
+    parts = _load_xml_dir(root)
+    if agent_name:
+        parts.extend(_load_xml_dir(root / agent_name))
     return "\n\n".join(parts) if parts else ""
 
 
@@ -116,12 +145,28 @@ def load_system_prompt_for_agent(
 
     base_content = prompt_file.read_text(encoding="utf-8")
 
-    # Build substitution dict for optional sections
+    # Build substitution dict for optional sections.
+    # ``agent_name`` is the prompt_key (e.g. "planner_agent", "recon_agent_adaptive").
+    # When set, playbooks_section / snippets_section also load files from the matching
+    # subdirectory (e.g. playbooks/planner_agent/*.xml) so per-agent domain knowledge
+    # stays out of the general system prompt.
     context_vars = context_vars or {}
     subs: Dict[str, str] = {
-        "playbooks_section": load_playbooks_section(base_path) if load_playbooks else "",
-        "snippets_section": load_snippets_section(base_path) if load_snippets else "",
-        "context_section": load_context_section(base_path, context_vars=context_vars) if load_context else "",
+        "playbooks_section": (
+            load_playbooks_section(base_path, agent_name=agent_name)
+            if load_playbooks
+            else ""
+        ),
+        "snippets_section": (
+            load_snippets_section(base_path, agent_name=agent_name)
+            if load_snippets
+            else ""
+        ),
+        "context_section": (
+            load_context_section(base_path, context_vars=context_vars)
+            if load_context
+            else ""
+        ),
     }
 
     # If base prompt uses old-style {shell_context} only (no section placeholders), support that too

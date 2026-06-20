@@ -15,7 +15,7 @@ This repo includes `docker-compose.yaml` for building/running the LangGraph API 
 Prereqs:
 
 - Create the shared docker network once (same name as other `gencyber-*` repos): `generative-cybersecurity-network`
-- Provide required secrets via environment variables (OpenAI key, etc.). From the monorepo root you can run with the root `.env`.
+- Provide required secrets via environment variables (OpenRouter API key, etc.). From the monorepo root you can run with the root `.env`.
 
 Typical split-repo startup order:
 

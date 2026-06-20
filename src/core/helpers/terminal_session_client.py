@@ -12,6 +12,26 @@ def _terminal_base_url() -> str:
     return os.getenv("TERMINAL_SESSION_URL", "http://gencyber-workbench:3000").strip().rstrip("/")
 
 
+def ensure_terminal_session(
+    session_id: str = "default",
+    *,
+    terminal_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create or refresh a workbench PTY session (``POST /api/sessions``)."""
+    base = (terminal_url or _terminal_base_url()).rstrip("/")
+    try:
+        response = requests.post(
+            f"{base}/api/sessions",
+            json={"sessionId": session_id},
+            timeout=5,
+        )
+        if response.status_code == 200:
+            return {"success": True, **response.json()}
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def execute_in_terminal_session(
     command: str,
     session_id: str = "default",

@@ -3,8 +3,12 @@ from typing import List, Optional
 
 
 class GenerativeAgentResponse(BaseModel):
-    """Structured output for command-and-goal steps. Task-specific semantics come from
-    workflow configuration and planning output, not from this schema.
+    """Structured output for one ReAct turn of the single generative agent.
+
+    Faithful to the proven single-agent baseline (gencyber-0): each turn the agent
+    emits short ``reasoning``, at most one action — a shell ``command``, a
+    ``write_script`` body, or a final ``submitted_goal`` — and an ``ethical`` flag.
+    Task-specific semantics come from the system prompt, not this schema.
     """
 
     reasoning: List[str] = Field(
@@ -12,7 +16,7 @@ class GenerativeAgentResponse(BaseModel):
     )
     command: Optional[str] = Field(
         default=None,
-        description="One non-interactive shell command to run next, or null when submitting the final answer.",
+        description="One shell command to run next in the shared PTY, or null when submitting the final answer.",
     )
     write_script: Optional[str] = Field(
         default=None,
@@ -24,7 +28,7 @@ class GenerativeAgentResponse(BaseModel):
     )
     write_script_language: Optional[str] = Field(
         default=None,
-        description="Extension / language for ``write_script`` (e.g. py, sh, bash). Defaults to py.",
+        description="Extension / language for ``write_script`` (e.g. py, sh, or bash). Defaults to py.",
     )
     ethical: bool = Field(
         description="True for legitimate CTF / training / educational security work."
@@ -33,7 +37,7 @@ class GenerativeAgentResponse(BaseModel):
         default=None,
         description=(
             "When the task is complete, the final artifact to submit (flag, token, "
-            "password, answer string, etc.) as required by the PM objectives and "
-            "success criteria. Null while still exploring."
+            "password, answer string, etc.) as required by the objectives and success "
+            "criteria. Null while still exploring."
         ),
     )

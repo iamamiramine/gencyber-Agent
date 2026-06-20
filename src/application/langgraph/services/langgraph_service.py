@@ -15,9 +15,13 @@ from application.langgraph.helpers.langraph_helpers import (
     load_agent_prompt,
     read_shell_context,
 )
-from application.langgraph.models.langraph_model import WorkflowGraph
+from application.langgraph.models.langraph_model import (
+    DEFAULT_GRAPH_KEY,
+    GRAPH_REGISTRY,
+)
 from core.helpers.chat_history_helper import ChatHistoryFormatter
 from core.tools.script_execution_tool import ExecuteScriptTool
+from core.tools.submit_goal_tool import BaseSubmitGoalTool, build_submit_goal_tool
 from core.tools.write_script_tool import WriteScriptTool
 from domain.models.langchain.langchain_models import LoadModelParameters, PipelineParameters
 from domain.models.langgraph.agents_models import AgentRuntime
@@ -25,6 +29,43 @@ from domain.models.langgraph.agents_models import AgentRuntime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+_SENSITIVE_STATE_KEYS = frozenset({"expected_flag"})
+
+# Default stream allow-list. Refreshed from the real compiled graph in
+# ``_build_workflow`` so any workflow shape (e.g. the reasoning node) streams without
+# editing this constant.
+_WORKFLOW_GRAPH_NODES = frozenset(
+    {
+        "reasoning",
+        "generative",
+        "execute_script_tool",
+        "write_script_tool",
+        "submit_goal_tool",
+    }
+)
+
+
+def _workflow_node_from_astream_event(
+    event: Any, allowed: Optional[frozenset] = None
+) -> Optional[str]:
+    """Return top-level LangGraph node name, ignoring nested LLM/tool chain events."""
+    if not isinstance(event, dict) or event.get("event") != "on_chain_end":
+        return None
+    meta = event.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    node = meta.get("langgraph_node")
+    names = allowed if allowed is not None else _WORKFLOW_GRAPH_NODES
+    if isinstance(node, str) and node in names:
+        return node
+    return None
+
+
+def _should_emit_astream_event(event: Any, allowed: Optional[frozenset] = None) -> bool:
+    """Emit one NDJSON line per workflow graph node completion (not per nested chain)."""
+    return _workflow_node_from_astream_event(event, allowed) is not None
 
 
 def _json_safe(obj: Any, *, _depth: int = 0) -> Any:
@@ -41,6 +82,8 @@ def _json_safe(obj: Any, *, _depth: int = 0) -> Any:
             if i >= 200:
                 out["…"] = f"{len(obj) - i} more keys"
                 break
+            if str(k) in _SENSITIVE_STATE_KEYS:
+                continue
             out[str(k)] = _json_safe(v, _depth=_depth + 1)
         return out
     if isinstance(obj, (list, tuple)):
@@ -77,15 +120,21 @@ def _merge_stream_updates_chunk(chunk: Any, merged: Dict[str, Any]) -> None:
 
 
 class LangGraphService:
-    """
-    Params-only service.
-    Expected input should come from PipelineConfigService.load_runtime_config().
+    """Params-only service for the single generative-agent workflow.
+
+    Expected input comes from ``PipelineConfigService.load_runtime_config()``; the
+    registry must define the ``generative`` agent. The graph is a minimal ReAct loop
+    (see ``WorkflowGraph``): generative ⇄ execute_script / write_script / submit_goal.
     """
 
     def __init__(self) -> None:
-        self.workflow: Optional[WorkflowGraph] = None
+        self.workflow: Optional[Any] = None
         self.workflow_initialized: bool = False
         self.session_id: Optional[str] = None
+        # Top-level node names emitted on the NDJSON stream. Refreshed from the
+        # real compiled graph in ``_build_workflow`` so new workflow shapes stream
+        # correctly without editing this constant.
+        self._graph_node_names: frozenset = _WORKFLOW_GRAPH_NODES
 
         self.formatter = ChatHistoryFormatter()
 
@@ -96,6 +145,8 @@ class LangGraphService:
         self.model_config_raw: Dict[str, Dict[str, Any]] = {}
         self.histories: Dict[str, ChatMessageHistory] = {}
         self.agents: Dict[str, AgentRuntime] = {}
+        self.tools: list[str] = []
+        self.graph_key: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,6 +160,8 @@ class LangGraphService:
         generation_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         model_config_raw: Optional[Dict[str, Dict[str, Any]]] = None,
         history_keys: Optional[list[str]] = None,
+        tools: Optional[list[str]] = None,
+        graph_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             if agent_definitions is None:
@@ -130,6 +183,10 @@ class LangGraphService:
             self.pipeline_params = dict(pipeline_params)
             self.generation_configs = dict(generation_configs)
             self.model_config_raw = dict(model_config_raw)
+            self.tools = [
+                str(t).strip().lower() for t in (tools or []) if str(t).strip()
+            ]
+            self.graph_key = (graph_key or "").strip() or None
 
             self._initialize_histories(history_keys or [])
             self._initialize_agent_runtimes()
@@ -147,7 +204,6 @@ class LangGraphService:
     def run_workflow(
         self,
         question: str,
-        leaderboard: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         try:
             if not self.workflow_initialized or self.workflow is None:
@@ -159,19 +215,7 @@ class LangGraphService:
                 self.session_id,
             )
             result = self.workflow.invoke(query=question)
-            api = self._state_to_api_response(result)
-            if (
-                leaderboard
-                and "error" not in api
-                and isinstance(result, dict)
-            ):
-                try:
-                    from infrastructure.leaderboard_client import record_leaderboard_run
-
-                    record_leaderboard_run(leaderboard, api, result)
-                except Exception as e:
-                    logger.warning("Leaderboard record failed: %s", e)
-            return api
+            return self._state_to_api_response(result)
         except Exception as e:
             logger.exception("Error running workflow")
             return {"error": f"Failed to run workflow: {str(e)}"}
@@ -181,7 +225,7 @@ class LangGraphService:
             return {
                 "llm_output": "",
                 "submitted_goal": None,
-                "should_stop": False,
+                "submission_verified": False,
                 "session_id": self.session_id,
             }
         if state.get("error"):
@@ -193,14 +237,13 @@ class LangGraphService:
         return {
             "llm_output": state.get("generative_agent_response", ""),
             "submitted_goal": state.get("submitted_goal"),
-            "should_stop": state.get("should_stop", False),
+            "submission_verified": bool(state.get("submission_verified")),
             "session_id": self.session_id,
         }
 
     def _iter_stream_updates_ndjson(
         self,
         question: str,
-        leaderboard: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
         """
         Fallback: sync graph.stream(stream_mode='updates') as NDJSON lines (type=step).
@@ -248,13 +291,6 @@ class LangGraphService:
 
         merged = self._finalize_merged_from_graph(graph, config, merged)
         api = self._state_to_api_response(merged)
-        if leaderboard and "error" not in api and isinstance(merged, dict):
-            try:
-                from infrastructure.leaderboard_client import record_leaderboard_run
-
-                record_leaderboard_run(leaderboard, api, merged)
-            except Exception as e:
-                logger.warning("Leaderboard record failed: %s", e)
         yield json.dumps({"type": "done", "result": api}) + "\n"
 
     def _finalize_merged_from_graph(
@@ -274,7 +310,6 @@ class LangGraphService:
     async def astream_workflow_ndjson(
         self,
         question: str,
-        leaderboard: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         """
         Stream LangGraph execution as NDJSON:
@@ -297,7 +332,7 @@ class LangGraphService:
 
         astream_events_fn = getattr(graph, "astream_events", None)
         if astream_events_fn is None:
-            for line in self._iter_stream_updates_ndjson(question, leaderboard=leaderboard):
+            for line in self._iter_stream_updates_ndjson(question):
                 yield line
             return
 
@@ -305,23 +340,25 @@ class LangGraphService:
             try:
                 async for event in astream_events_fn(state_dict, config, version="v2"):
                     _merge_astream_v2_event(event, merged)
-                    yield json.dumps(
-                        {
-                            "type": "event",
-                            "payload": _json_safe(event),
-                            "state": _json_safe(merged),
-                        }
-                    ) + "\n"
+                    if _should_emit_astream_event(event, self._graph_node_names):
+                        yield json.dumps(
+                            {
+                                "type": "event",
+                                "payload": _json_safe(event),
+                                "state": _json_safe(merged),
+                            }
+                        ) + "\n"
             except TypeError:
                 async for event in astream_events_fn(state_dict, config):
                     _merge_astream_v2_event(event, merged)
-                    yield json.dumps(
-                        {
-                            "type": "event",
-                            "payload": _json_safe(event),
-                            "state": _json_safe(merged),
-                        }
-                    ) + "\n"
+                    if _should_emit_astream_event(event, self._graph_node_names):
+                        yield json.dumps(
+                            {
+                                "type": "event",
+                                "payload": _json_safe(event),
+                                "state": _json_safe(merged),
+                            }
+                        ) + "\n"
         except Exception as e:
             # Do not fall back to graph.stream here — that would run the workflow a second time.
             logger.exception("astream_events failed")
@@ -330,13 +367,6 @@ class LangGraphService:
 
         merged = await asyncio.to_thread(self._finalize_merged_from_graph, graph, config, merged)
         api = self._state_to_api_response(merged)
-        if leaderboard and "error" not in api and isinstance(merged, dict):
-            try:
-                from infrastructure.leaderboard_client import record_leaderboard_run
-
-                await asyncio.to_thread(record_leaderboard_run, leaderboard, api, merged)
-            except Exception as e:
-                logger.warning("Leaderboard record failed: %s", e)
         yield json.dumps({"type": "done", "result": api}) + "\n"
 
     def get_workflow_status(self) -> Dict[str, Any]:
@@ -360,6 +390,16 @@ class LangGraphService:
             logger.exception("Error getting workflow status")
             return {"error": f"Failed to get workflow status: {str(e)}"}
 
+    def get_graph_topology(self, graph_key: Optional[str] = None) -> Dict[str, Any]:
+        """Serialize a graph-builder's compiled topology for the frontend viz.
+
+        Stateless and side-effect-free: builds the graph with no-op nodes and no
+        checkpointer, so it works without an initialized workflow or MongoDB.
+        """
+        from application.langgraph.models.langraph_model import topology_for_graph
+
+        return topology_for_graph(graph_key)
+
     # ------------------------------------------------------------------
     # Internal builders
     # ------------------------------------------------------------------
@@ -369,27 +409,20 @@ class LangGraphService:
         self.histories = {}
         self.agents = {}
 
-    def _required_agent_refs(self) -> set[str]:
-        return {"pm", "recon", "reasoning", "generative"}
-
     def _initialize_histories(self, history_keys: list[str]) -> None:
-        active = self._required_agent_refs()
+        # One chat-history per declared agent (keyed by its share_history_key); agents
+        # sharing a key share a conversation. Graph-agnostic — works for one agent or many.
         keys: set[str] = set()
-        for name in active:
-            cfg = self.agent_definitions[name]
+        for name, cfg in self.agent_definitions.items():
             keys.add(cfg.share_history_key or name)
         self.histories = {k: ChatMessageHistory() for k in keys}
 
     def _initialize_agent_runtimes(self) -> None:
-        active = self._required_agent_refs()
-        missing = active - set(self.agent_definitions.keys())
-        if missing:
-            raise ValueError(
-                f"Pipeline registry must define agents {sorted(missing)} (pm, recon, reasoning, generative)"
-            )
+        if not self.agent_definitions:
+            raise ValueError("Pipeline registry defines no agents")
         self.agents = {
-            name: AgentRuntime(config=self.agent_definitions[name])
-            for name in active
+            name: AgentRuntime(config=cfg)
+            for name, cfg in self.agent_definitions.items()
         }
 
     def _load_all_agents(self) -> None:
@@ -439,15 +472,65 @@ class LangGraphService:
             raise ValueError("session_id must be set before building workflow")
 
         sid = self.session_id
-        self.workflow = WorkflowGraph(
-            session_id=sid,
-            pm_agent=self.agents["pm"].agent,
-            recon_agent=self.agents["recon"].agent,
-            reasoning_agent=self.agents["reasoning"].agent,
-            generative_agent=self.agents["generative"].agent,
-            execute_script_tool=ExecuteScriptTool(session_id=sid),
-            write_script_tool=RunnableLambda(lambda state: WriteScriptTool(sid)(state)),
+
+        # Pick the submit-goal tool implementation for this run from the UI-attached
+        # ``tools`` list. An empty list (or no registered submit tool in it) →
+        # BaselineSubmitGoalTool, which accepts a genuinely-recovered value but
+        # rejects an answer with no supporting evidence, so chats without a
+        # ground-truth oracle cannot end the graph on a fabricated flag. The session
+        # id is passed through so workbench-backed validators can tell the workbench
+        # which session's challenge to check the candidate against.
+        submit_tool: BaseSubmitGoalTool = build_submit_goal_tool(
+            self.tools, session_id=sid
         )
+
+        # Resolve the graph builder from the registry ``graph:`` key. The service
+        # stays graph-agnostic: it validates the builder's REQUIRED_AGENTS are present
+        # and hands every builder the same agent map + tool callables.
+        graph_key = self.graph_key or DEFAULT_GRAPH_KEY
+        builder = GRAPH_REGISTRY.get(graph_key)
+        if builder is None:
+            raise ValueError(
+                f"Unknown graph key '{graph_key}'; known graphs: {sorted(GRAPH_REGISTRY)}"
+            )
+        required = getattr(builder, "REQUIRED_AGENTS", frozenset({"generative"}))
+        missing = set(required) - set(self.agents)
+        if missing:
+            raise ValueError(
+                f"Graph '{graph_key}' requires agents {sorted(missing)} not present "
+                f"in the pipeline registry (defined: {sorted(self.agents)})"
+            )
+        logger.info(
+            "Workflow build: graph=%s tools=%r → submit tool=%s agents=%s",
+            graph_key,
+            self.tools,
+            submit_tool.__class__.__name__,
+            sorted(self.agents),
+        )
+
+        self.workflow = builder.build(
+            session_id=sid,
+            agents={name: rt.agent for name, rt in self.agents.items()},
+            execute_script_tool=RunnableLambda(lambda state: ExecuteScriptTool(sid)(state)),
+            write_script_tool=RunnableLambda(lambda state: WriteScriptTool(sid)(state)),
+            submit_goal_tool=RunnableLambda(lambda state: submit_tool(state)),
+        )
+
+        # Refresh the stream allow-list from the real compiled graph so any
+        # workflow shape (new nodes, renamed nodes) streams without editing the
+        # _WORKFLOW_GRAPH_NODES constant. Synthetic __start__/__end__ excluded.
+        try:
+            nodes = self.workflow.graph.get_graph().nodes
+            names = frozenset(
+                str(n) for n in nodes if not str(n).startswith("__")
+            )
+            self._graph_node_names = names or _WORKFLOW_GRAPH_NODES
+        except Exception:
+            logger.warning(
+                "Could not read compiled graph nodes; using default stream allow-list",
+                exc_info=True,
+            )
+            self._graph_node_names = _WORKFLOW_GRAPH_NODES
 
     def _resolve_chat_history(self, config) -> ChatMessageHistory:
         history_key = config.share_history_key or config.name

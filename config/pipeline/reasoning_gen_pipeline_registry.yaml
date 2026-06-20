@@ -1,0 +1,15 @@
+name: reasoning + generative agentic workflow
+
+# Selects the ReasoningGenWorkflowGraph builder in GRAPH_REGISTRY. Omitting this key
+# (as default_pipeline_registry.yaml does) selects the single-agent BaselineWorkflow.
+graph: ReasoningGenWorkflow
+
+agents:
+  # The reasoning agent receives the briefing/feedback, owns the Evidence-Guided
+  # Attack Tree + task-difficulty assessment, and decides when the run ends.
+  - name: reasoning
+    config_path: config/agents/reasoning_agent_config.yaml
+  # The directed generative agent executes exactly one reasoning directive per turn
+  # (one shell command / script / submission) and reports the result back.
+  - name: generative
+    config_path: config/agents/directed_generative_agent_config.yaml

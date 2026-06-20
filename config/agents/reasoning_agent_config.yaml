@@ -3,22 +3,24 @@ Agent_Config:
   prompt_key: reasoning_agent
   structured_output_key: ReasoningAgentResponse
   agent_class_key: ReasoningAgent
-  share_history_key: shared_execution
+  share_history_key: reasoning_planning
   bind_max_tokens: true
   base_path: "./config/"
   extra_prompt_kwargs: {}
 
 Model_Params:
-  provider: openai
-  model_name: gpt-4o-mini
-  model_path: gpt-4o-mini
+  provider: openrouter
+  model_name: openai/gpt-4o-mini
+  model_path: openai/gpt-4o-mini
   # bit_quantization: 8
   max_retries: 1
   base_url: null
 
 Pipeline_Params:
   task_type: text-generation
-  max_new_tokens: 2048
+  # The reasoning agent re-emits the FULL Evidence-Guided Attack Tree every turn,
+  # so it needs a larger output budget than the single-action generative agent.
+  max_new_tokens: 4096
   do_sample: false
   temperature: 0.2
   top_p: 0.95
@@ -27,15 +29,18 @@ Pipeline_Params:
   presence_penalty: 0.0
   frequency_penalty: 0.0
   no_repeat_ngram_size: 3
+  # The reasoning agent plans; it does not run shell commands. Loading the
+  # execution-oriented playbooks/snippets (e.g. linux_snippets) would only pollute
+  # its planning context, so keep them off — the directed generative agent owns those.
   load_playbooks: false
-  load_snippets: true
-  load_context: true
+  load_snippets: false
+  load_context: false
 
 Generation_Config:
   temperature: 0.2
   top_p: 0.95
   top_k: 40
-  max_tokens: 2048
+  max_tokens: 4096
   repetition_penalty: 1.0
   presence_penalty: 0.0
   frequency_penalty: 0.0

@@ -1,0 +1,42 @@
+<!-- ==================== POST-EXECUTION INTERPRETATION ==================== -->
+
+<Playbook name="ExecutionFeedback">
+Description:
+After each command, read stdout/stderr and ``[exit_code=...]`` **before** choosing the next action. Apply these patterns when output matches — do not repeat broken commands.
+
+repeat-failure:
+- If the **same command** failed twice with the same error, stop rerunning it. Change technique (see other playbooks/snippets).
+
+python3-c-syntax:
+- ``SyntaxError`` on ``python3 -c`` usually means ``for``/``while``/``def``/``with``/``try`` in a one-liner. Use ``write_script`` with the full program, then ``command``: ``python3 /workspace/.gencyber-agent-scripts/&lt;file&gt;.py``.
+
+python3-c-multiline:
+- If you already know the script needs loops or functions, use ``write_script`` first — do not attempt ``python3 -c``.
+
+script-truncated:
+- ``SyntaxError: unterminated string literal`` on a saved ``.py`` often means the script body was cut off or embedded a huge ``b'...'`` literal. Rewrite a **short** script that uses ``open(path, 'rb')`` and prints only size/magic/first 64 bytes hex.
+
+struct-unpack:
+- ``struct.error`` / ``unpack requires a buffer`` — fix format string or read length; inspect layout with ``xxd`` or a small read script; update logic in ``write_script``.
+
+traceback:
+- On Python traceback, read the **last line** for the error type; fix that line in a saved script and re-run the path — avoid longer ``python3 -c`` one-liners.
+
+binary-dump:
+- Huge ``b'...'`` or ``\x`` floods in stdout: do not print whole files; show size, magic, and a short hex prefix only.
+
+repeat-success:
+- Same command twice with exit 0 but no new flag-like token in output: stop repeating; try a different probe or submit only when the flag appears in output.
+
+missing-tool:
+- ``command not found``: use CommandResolver fallbacks; the sandbox is Kali-class — prefer installed alternatives over mid-run ``apt install`` unless appropriate.
+
+sshpass-no-ssh:
+- ``sshpass: failed to run command`` — install ``openssh-client`` then retry the sshpass line.
+
+embedded-file-data:
+- Do not paste multi-KB challenge files into ``write_script`` as string/bytes literals; read paths with ``open(..., 'rb')``.
+
+write_script size:
+- Scripts over ~256KB are rejected; split logic or read files from disk.
+</Playbook>

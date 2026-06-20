@@ -1,0 +1,5 @@
+<Snippet name="SSHPasswordOneLiner">
+When the brief gives username + password + host + port, prefer:
+``sshpass -p 'PASSWORD' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p PORT USER@HOST 'whoami'``
+See SSHPasswordAuth playbook if ``sshpass`` is missing.
+</Snippet>
