@@ -9,9 +9,7 @@ from typing import Any, Dict, List, Set
 
 import yaml
 
-from core.agents.directed_generative_agent import DirectedGenerativeAgent
 from core.agents.generative_agent import GenerativeAgent
-from core.agents.reasoning_agent import ReasoningAgent
 from domain.models.langchain.langchain_models import LoadModelParameters, PipelineParameters
 from domain.models.langgraph.agents_models import AgentConfig
 from domain.models.structured_outputs.generative_agent_structured_output import GenerativeAgentResponse
@@ -22,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 AGENT_CLASS_REGISTRY: Dict[str, type] = {
     "GenerativeAgent": GenerativeAgent,
-    "DirectedGenerativeAgent": DirectedGenerativeAgent,
-    "ReasoningAgent": ReasoningAgent,
 }
 
 STRUCTURED_OUTPUT_REGISTRY: Dict[str, type] = {

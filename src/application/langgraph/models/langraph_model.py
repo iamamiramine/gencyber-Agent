@@ -11,7 +11,6 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.generative_agent import GenerativeAgentState
-from core.agents.reasoning_agent import ReasoningAgentState
 from infrastructure.repository.mongodb_repository import get_mongodb_client
 
 logger = logging.getLogger(__name__)
@@ -273,3 +272,7 @@ class WorkflowGraph:
                 "error": str(e),
                 "generated_response": f"I encountered an error processing your request: {str(e)}",
             }
+
+GRAPH_REGISTRY: Dict[str, Any] = {
+    "WorkflowGraph": WorkflowGraph,
+}

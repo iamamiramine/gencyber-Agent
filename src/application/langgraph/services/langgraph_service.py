@@ -16,7 +16,6 @@ from application.langgraph.helpers.langraph_helpers import (
     read_shell_context,
 )
 from application.langgraph.models.langraph_model import (
-    DEFAULT_GRAPH_KEY,
     GRAPH_REGISTRY,
 )
 from core.helpers.chat_history_helper import ChatHistoryFormatter
@@ -32,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 
 _SENSITIVE_STATE_KEYS = frozenset({"expected_flag"})
+
+# The only graph builder shipped today. Used whenever the pipeline registry omits a
+# ``graph:`` key (the common case) so the service resolves to a real registry entry
+# instead of a bogus default.
+_DEFAULT_GRAPH_KEY = "WorkflowGraph"
 
 # Default stream allow-list. Refreshed from the real compiled graph in
 # ``_build_workflow`` so any workflow shape (e.g. the reasoning node) streams without
@@ -393,12 +397,17 @@ class LangGraphService:
     def get_graph_topology(self, graph_key: Optional[str] = None) -> Dict[str, Any]:
         """Serialize a graph-builder's compiled topology for the frontend viz.
 
-        Stateless and side-effect-free: builds the graph with no-op nodes and no
-        checkpointer, so it works without an initialized workflow or MongoDB.
+        Stateless and side-effect-free: the builder's ``topology()`` classmethod
+        compiles the graph with no-op nodes and no checkpointer, so it works without
+        an initialized workflow or MongoDB.
         """
-        from application.langgraph.models.langraph_model import topology_for_graph
-
-        return topology_for_graph(graph_key)
+        key = (graph_key or "").strip() or _DEFAULT_GRAPH_KEY
+        builder = GRAPH_REGISTRY.get(key)
+        if builder is None:
+            raise ValueError(
+                f"Unknown graph key '{key}'; known graphs: {sorted(GRAPH_REGISTRY)}"
+            )
+        return builder.topology()
 
     # ------------------------------------------------------------------
     # Internal builders
@@ -487,7 +496,7 @@ class LangGraphService:
         # Resolve the graph builder from the registry ``graph:`` key. The service
         # stays graph-agnostic: it validates the builder's REQUIRED_AGENTS are present
         # and hands every builder the same agent map + tool callables.
-        graph_key = self.graph_key or DEFAULT_GRAPH_KEY
+        graph_key = self.graph_key or _DEFAULT_GRAPH_KEY
         builder = GRAPH_REGISTRY.get(graph_key)
         if builder is None:
             raise ValueError(
