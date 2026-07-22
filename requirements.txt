@@ -8,22 +8,30 @@ rank_bm25
 
 chromadb
 
-langchain>=0.1.0
-langchain-core>=0.1.10
-langchain_chroma
-langchain-community>=0.0.10
-langchain-huggingface
-langchain-openai
-langchain-ollama
+# --- LangChain 1.x stack (required by deepagents) ---
+langchain-core>=1.4.7,<2
+langchain>=1.3.9,<2
+langsmith>=0.8.11
 
-langsmith>=0.0.63
+langchain-openai>=1.3.0,<2
+langchain-ollama>=1.1.0,<2
+langchain-community>=0.4.2,<0.5
+langchain-chroma>=1.1.0,<2
+langchain-huggingface>=1.2.2,<2
+langchain-mongodb>=0.11.0
 
-langgraph>=0.0.10
-langgraph-checkpoint-mongodb
-langgraph-store-mongodb
+langgraph>=1.2.0,<2
+langgraph-checkpoint-mongodb>=0.4.0
+langgraph-store-mongodb>=0.3.0
+
+# Tracing/observability (self-hosted). v4 = OTEL-native: langfuse.langchain.CallbackHandler
+# + @observe + get_client. Tracing is opt-in via LANGFUSE_* env; absent keys → no-op.
+langfuse>=4,<5
+
+deepagents>=0.6.11,<0.7
 
 
-websockets>=10.0,<12.0
+websockets>=15.0,<16.0
 
 python-dotenv>=1.0.0
 feedparser

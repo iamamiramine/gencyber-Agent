@@ -7,6 +7,8 @@ import os
 
 from langgraph.store.mongodb import MongoDBStore, create_vector_index_config
 
+from infrastructure.observability.langfuse_tracer import observe
+
 logger = logging.getLogger(__name__)
 
 class MemoryLogger:
@@ -57,9 +59,10 @@ class MemoryLogger:
             self.mongodb_uri = None
             self.index_config = None
 
-    def log_comprehensive_interaction(self, 
-                                    session_id: str, 
-                                    agent_type: str, 
+    @observe(name="memory-write-interaction")
+    def log_comprehensive_interaction(self,
+                                    session_id: str,
+                                    agent_type: str,
                                     original_query: str,
                                     query_to_process: str,
                                     state: Dict[str, Any],
@@ -122,6 +125,7 @@ class MemoryLogger:
             logger.error(f"Failed to log comprehensive memory for {agent_type}: {e}")
             return False
 
+    @observe(name="memory-write-execution-event")
     def log_execution_event(self,
                             session_id: str,
                             command: str,

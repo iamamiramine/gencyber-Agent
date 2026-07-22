@@ -57,7 +57,31 @@ class WorkflowInitParams(BaseModel):
     )
     base_url: Optional[str] = Field(
         default=None,
-        description="Optional base URL (required for Ollama models).",
+        description="Optional base URL (required for Ollama / vLLM / OpenAI-compatible models).",
+    )
+    # Per-run escalation ladder controls. The escalation target is chosen by the
+    # operator here (not by the agent) and overrides GENCYBER_ESCALATION_* env
+    # defaults for THIS run only. Omit any field to inherit the env default.
+    escalation_model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Strong model this run escalates to when a specialist stalls / submits a "
+            "bad flag (e.g. 'openai/gpt-5-mini', 'deepseek/deepseek-chat', a vLLM served "
+            "name). 'off'/'none' disables escalation for this run. Omit to use the "
+            "GENCYBER_ESCALATION_MODEL env default."
+        ),
+    )
+    escalation_after_actions: Optional[int] = Field(
+        default=None,
+        description="Actions-without-a-flag that trip a stall escalation (env default 12).",
+    )
+    escalation_provider: Optional[str] = Field(
+        default=None,
+        description="Optional provider for the escalation model (else inherits the base model's).",
+    )
+    escalation_base_url: Optional[str] = Field(
+        default=None,
+        description="Optional base URL for the escalation model (else inherits the base model's).",
     )
     tools: Optional[List[str]] = Field(
         default=None,
@@ -199,6 +223,10 @@ def init_workflow(workflow_init_params: Optional[WorkflowInitParams] = None) -> 
             history_keys=rt["history_keys"],
             tools=params.tools,
             graph_key=rt.get("graph"),
+            escalation_model=params.escalation_model,
+            escalation_after_actions=params.escalation_after_actions,
+            escalation_provider=params.escalation_provider,
+            escalation_base_url=params.escalation_base_url,
         )
     except Exception as e:
         logger.exception("Unexpected controller error during workflow initialization")

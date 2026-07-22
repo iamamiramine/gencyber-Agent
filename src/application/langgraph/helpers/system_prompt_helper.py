@@ -9,6 +9,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from infrastructure.observability.langfuse_prompts import managed_text_for_file
+
 logger = logging.getLogger(__name__)
 
 # Default root for prompts and prompt assets (relative to cwd when the app runs)
@@ -19,42 +21,63 @@ def _prompts_dir(base_path: str) -> Path:
     return Path(base_path) / "prompts"
 
 
-def _read_file(path: Path, default: str = "") -> str:
-    """Read file content or return default if missing."""
-    try:
-        if path.exists():
-            return path.read_text(encoding="utf-8").strip()
-    except Exception as e:
-        logger.warning("Could not read %s: %s", path, e)
-    return default
-
-
-def _replace_named_placeholders(template: str, values: Dict[str, Any]) -> str:
-    """
-    Substitute only ``{key}`` tokens for keys present in ``values``.
-
-    Unlike ``str.format``, arbitrary literal braces (e.g. ``flag{...}`` in examples) are left
-    untouched. Keys are applied longest-first so ``{shell_context_extra}`` wins over ``{shell_context}``.
-    """
-    out = template
-    for k, v in sorted(values.items(), key=lambda kv: (-len(kv[0]), kv[0])):
-        if not isinstance(k, str):
-            continue
-        token = "{" + k + "}"
-        if token in out:
-            out = out.replace(token, "" if v is None else str(v))
-    return out
-
-
 def _load_xml_dir(root: Path) -> list[str]:
-    """Read every ``*.xml`` file in ``root`` (non-recursive) into a list of content strings."""
+    """Load every ``*.xml`` file in ``root`` (non-recursive) as managed prompt text.
+
+    Each file resolves to its Langfuse-managed version (leaf asset, fetched raw) and
+    falls back to the on-disk content when Langfuse is disabled/unreachable.
+    """
     if not root.exists() or not root.is_dir():
         return []
     parts: list[str] = []
     for f in sorted(root.glob("*.xml")):
-        content = _read_file(f)
+        content = managed_text_for_file(f)
         if content:
             parts.append(content)
+    return parts
+
+
+# Some agents reuse another agent's prompt-asset pack instead of duplicating the XML
+# files. The DeepAgents generative worker (prompt_key ``deep_generative_agent``) shares
+# the baseline generative agent's playbooks/snippets — crucially the EnIGMA interactive-
+# tools (IAT) guide — so the planner's specialist subagents learn the
+# ``debug_start`` / ``connect_start`` interfaces instead of reaching for raw ``gdb`` /
+# ``nc`` (which open their own REPL and wedge the workbench sentinel PTY).
+_AGENT_ASSET_ALIASES: Dict[str, str] = {
+    "deep_generative_agent": "generative_agent",
+}
+
+
+def _load_agent_assets(root: Path, agent_name: Optional[str]) -> list[str]:
+    """Load shared (``root``) assets, then this agent's per-agent assets, then any
+    aliased agent's assets (see :data:`_AGENT_ASSET_ALIASES`).
+
+    The alias lets an agent inherit another agent's asset directory without copying
+    files, keeping a single source of truth for shared guidance.
+
+    Directories are de-duplicated by resolved path, so when a per-agent directory is
+    itself a symlink to the aliased directory (an alternative, filesystem-based way to
+    share a pack) the same files are not loaded twice.
+    """
+    seen: set = set()
+    parts: list[str] = []
+
+    def _add(directory: Path) -> None:
+        try:
+            key = directory.resolve()
+        except OSError:
+            key = directory
+        if key in seen:
+            return
+        seen.add(key)
+        parts.extend(_load_xml_dir(directory))
+
+    _add(root)
+    if agent_name:
+        _add(root / agent_name)
+        alias = _AGENT_ASSET_ALIASES.get(agent_name)
+        if alias and alias != agent_name:
+            _add(root / alias)
     return parts
 
 
@@ -66,7 +89,7 @@ def load_playbooks_section(
 ) -> str:
     """Load playbook XML files for this agent.
 
-    Files are sourced from two locations and concatenated in this order:
+    Files are sourced from these locations and concatenated in order:
 
       1. ``{base_path}/prompts/{subdir}/*.xml`` — **shared** playbooks loaded by every
          agent (e.g. ``linux_playbook.xml``). Keeps backwards compatibility with the
@@ -75,11 +98,12 @@ def load_playbooks_section(
          that only this agent sees. Lets domain knowledge / examples / command catalogs
          live with the agent that consumes them, instead of being baked into the system
          prompt.
+      3. ``{base_path}/prompts/{subdir}/{alias}/*.xml`` — playbooks inherited from an
+         aliased agent (see :data:`_AGENT_ASSET_ALIASES`), so e.g. the DeepAgents
+         generative worker reuses the baseline generative agent's pack.
     """
     root = _prompts_dir(base_path) / subdir
-    parts = _load_xml_dir(root)
-    if agent_name:
-        parts.extend(_load_xml_dir(root / agent_name))
+    parts = _load_agent_assets(root, agent_name)
     return "\n\n".join(parts) if parts else ""
 
 
@@ -91,13 +115,12 @@ def load_snippets_section(
 ) -> str:
     """Load snippet XML files for this agent.
 
-    Same shared-then-per-agent layering as :func:`load_playbooks_section`. Shared files
-    at the root of ``{subdir}``; per-agent files under ``{subdir}/{agent_name}/``.
+    Same shared-then-per-agent(-then-alias) layering as :func:`load_playbooks_section`.
+    Shared files at the root of ``{subdir}``; per-agent files under
+    ``{subdir}/{agent_name}/``; inherited files under ``{subdir}/{alias}/``.
     """
     root = _prompts_dir(base_path) / subdir
-    parts = _load_xml_dir(root)
-    if agent_name:
-        parts.extend(_load_xml_dir(root / agent_name))
+    parts = _load_agent_assets(root, agent_name)
     return "\n\n".join(parts) if parts else ""
 
 
@@ -109,16 +132,19 @@ def load_context_section(
     """
     Load context template from {base_path}/prompts/context (e.g. linux_context.xml),
     then format with context_vars (e.g. {"shell_context": "..."}).
+
+    Context files are **templated** assets: they carry ``{{shell_context}}`` style
+    placeholders, so each resolves to its Langfuse-managed version compiled with
+    ``context_vars`` (offline: the local ``{{var}}`` substituter), falling back to the
+    on-disk file when Langfuse is disabled/unreachable.
     """
     root = _prompts_dir(base_path) / subdir
     if not root.exists():
         return ""
     parts = []
     for f in sorted(root.glob("*.xml")):
-        content = _read_file(f)
+        content = managed_text_for_file(f, variables=context_vars, templated=True)
         if content:
-            if context_vars:
-                content = _replace_named_placeholders(content, context_vars)
             parts.append(content)
     return "\n\n".join(parts) if parts else ""
 
@@ -135,15 +161,19 @@ def load_system_prompt_for_agent(
     """
     Load the system prompt for a given agent from {base_path}/prompts/{agent_name}_system.xml.
     Optionally inject playbooks, snippets, and context from under {base_path}/prompts/ when flags are True.
-    Placeholders in the base prompt: {playbooks_section}, {snippets_section}, {context_section}.
+    Placeholders in the base prompt: {{playbooks_section}}, {{snippets_section}}, {{context_section}}.
     If a section is not loaded, its placeholder is replaced with an empty string.
+
+    The base prompt is a **templated** asset: it resolves to its Langfuse-managed
+    version compiled with the section/context variables (offline: the local ``{{var}}``
+    substituter), falling back to the on-disk file when Langfuse is disabled/unreachable.
+    Section and context vars are passed together so the same call handles both the new
+    ``{{*_section}}`` placeholders and any legacy ``{{shell_context}}`` style vars.
     """
     prompts_dir = _prompts_dir(base_path)
     prompt_file = prompts_dir / f"{agent_name}_system.xml"
     if not prompt_file.exists():
         raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
-
-    base_content = prompt_file.read_text(encoding="utf-8")
 
     # Build substitution dict for optional sections.
     # ``agent_name`` is the prompt_key (e.g. "planner_agent", "recon_agent_adaptive").
@@ -169,10 +199,11 @@ def load_system_prompt_for_agent(
         ),
     }
 
-    # If base prompt uses old-style {shell_context} only (no section placeholders), support that too
-    if "playbooks_section" not in base_content and "snippets_section" not in base_content and "context_section" not in base_content:
-        if context_vars:
-            return _replace_named_placeholders(base_content, context_vars)
-        return base_content
-
-    return _replace_named_placeholders(base_content, subs)
+    # Compile the base prompt with section + context vars in one pass. Unbound
+    # ``{{...}}`` (e.g. literal flag-format examples / JSON) are left intact by both
+    # Langfuse ``.compile()`` and the local substituter.
+    return managed_text_for_file(
+        prompt_file,
+        variables={**context_vars, **subs},
+        templated=True,
+    )

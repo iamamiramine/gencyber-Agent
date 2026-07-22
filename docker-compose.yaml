@@ -11,10 +11,21 @@ services:
       - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT}
       - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
       - LANGSMITH_PROJECT=${LANGSMITH_PROJECT}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # gencyber-Engine (local open-source models); reached by container name on the
+      # shared network. Any model in config/models/engine_models.yaml routes here.
+      - GENCYBER_ENGINE_BASE_URL=${GENCYBER_ENGINE_BASE_URL:-http://gencyber-engine:8000/v1}
+      - GENCYBER_ENGINE_API_KEY=${GENCYBER_ENGINE_API_KEY:-}
+      - GENCYBER_ESCALATION_MODEL=${GENCYBER_ESCALATION_MODEL:-openai/gpt-5-mini}
+      - GENCYBER_ESCALATION_AFTER_ACTIONS=${GENCYBER_ESCALATION_AFTER_ACTIONS:-12}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
       - HF_HOME=${HF_HOME}
       - HF_TOKEN=${HF_TOKEN}
       - TERMINAL_SESSION_URL=${TERMINAL_SESSION_URL:-http://gencyber-workbench:3000}
+      - CHALLENGE_TOOLKIT_URL=${CHALLENGE_TOOLKIT_URL:-http://gencyber-workbench:80}
       - MONGODB_URI=${MONGODB_URI}
       - MONGODB_DATABASE=${MONGODB_DATABASE:-gencyber}
       - REGISTRY_PATH=${REGISTRY_PATH:-config/pipeline/default_pipeline_registry.yaml}

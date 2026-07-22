@@ -18,12 +18,14 @@ from application.langgraph.helpers.langraph_helpers import (
 from application.langgraph.models.langraph_model import (
     GRAPH_REGISTRY,
 )
+from application.langgraph.models.deep_generative_workflow import set_escalation_config
 from core.helpers.chat_history_helper import ChatHistoryFormatter
 from core.tools.script_execution_tool import ExecuteScriptTool
 from core.tools.submit_goal_tool import BaseSubmitGoalTool, build_submit_goal_tool
 from core.tools.write_script_tool import WriteScriptTool
 from domain.models.langchain.langchain_models import LoadModelParameters, PipelineParameters
 from domain.models.langgraph.agents_models import AgentRuntime
+from infrastructure.observability import langfuse_tracer
 
 
 logging.basicConfig(level=logging.INFO)
@@ -166,6 +168,10 @@ class LangGraphService:
         history_keys: Optional[list[str]] = None,
         tools: Optional[list[str]] = None,
         graph_key: Optional[str] = None,
+        escalation_model: Optional[str] = None,
+        escalation_after_actions: Optional[int] = None,
+        escalation_provider: Optional[str] = None,
+        escalation_base_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             if agent_definitions is None:
@@ -191,6 +197,17 @@ class LangGraphService:
                 str(t).strip().lower() for t in (tools or []) if str(t).strip()
             ]
             self.graph_key = (graph_key or "").strip() or None
+
+            # Per-run escalation target (operator-chosen, overrides env for this run
+            # only). Must be recorded before _build_workflow, which builds the strong
+            # model keyed by this session_id. No-op when all fields are None.
+            set_escalation_config(
+                session_id,
+                model=escalation_model,
+                after_actions=escalation_after_actions,
+                provider=escalation_provider,
+                base_url=escalation_base_url,
+            )
 
             self._initialize_histories(history_keys or [])
             self._initialize_agent_runtimes()
@@ -258,44 +275,51 @@ class LangGraphService:
 
         wf = self.workflow
         state_dict = wf._build_initial_state(question)
-        config = {
-            "configurable": {"thread_id": wf.session_id},
-            "recursion_limit": wf.recursion_limit,
-        }
         graph = wf.graph
         merged: Dict[str, Any] = dict(state_dict)
 
-        try:
-            stream_iter = graph.stream(state_dict, config, stream_mode="updates")
-        except Exception as e:
-            logger.warning("stream(stream_mode=updates) failed (%s); trying default stream", e)
+        with langfuse_tracer.traced_run(
+            wf.session_id, name=type(wf).__name__, tags=[type(wf).__name__, "stream"]
+        ) as handler:
+            config: Dict[str, Any] = {
+                "configurable": {"thread_id": wf.session_id},
+                "recursion_limit": wf.recursion_limit,
+            }
+            if handler is not None:
+                config["callbacks"] = [handler]
+
             try:
-                stream_iter = graph.stream(state_dict, config)
-            except Exception as e2:
-                yield json.dumps({"type": "error", "message": f"Cannot stream workflow: {e2!s}"}) + "\n"
+                stream_iter = graph.stream(state_dict, config, stream_mode="updates")
+            except Exception as e:
+                logger.warning("stream(stream_mode=updates) failed (%s); trying default stream", e)
+                try:
+                    stream_iter = graph.stream(state_dict, config)
+                except Exception as e2:
+                    yield json.dumps({"type": "error", "message": f"Cannot stream workflow: {e2!s}"}) + "\n"
+                    return
+
+            seq = 0
+            try:
+                for chunk in stream_iter:
+                    seq += 1
+                    _merge_stream_updates_chunk(chunk, merged)
+                    yield json.dumps(
+                        {
+                            "type": "step",
+                            "seq": seq,
+                            "chunk": _json_safe(chunk),
+                            "state": _json_safe(merged),
+                        }
+                    ) + "\n"
+            except Exception as e:
+                logger.exception("workflow stream failed")
+                yield json.dumps({"type": "error", "message": str(e)}) + "\n"
                 return
 
-        seq = 0
-        try:
-            for chunk in stream_iter:
-                seq += 1
-                _merge_stream_updates_chunk(chunk, merged)
-                yield json.dumps(
-                    {
-                        "type": "step",
-                        "seq": seq,
-                        "chunk": _json_safe(chunk),
-                        "state": _json_safe(merged),
-                    }
-                ) + "\n"
-        except Exception as e:
-            logger.exception("workflow stream failed")
-            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
-            return
-
-        merged = self._finalize_merged_from_graph(graph, config, merged)
-        api = self._state_to_api_response(merged)
-        yield json.dumps({"type": "done", "result": api}) + "\n"
+            merged = self._finalize_merged_from_graph(graph, config, merged)
+            langfuse_tracer.record_output(_json_safe(merged))
+            api = self._state_to_api_response(merged)
+            yield json.dumps({"type": "done", "result": api}) + "\n"
 
     def _finalize_merged_from_graph(
         self,
@@ -327,10 +351,6 @@ class LangGraphService:
 
         wf = self.workflow
         state_dict = wf._build_initial_state(question)
-        config = {
-            "configurable": {"thread_id": wf.session_id},
-            "recursion_limit": wf.recursion_limit,
-        }
         graph = wf.graph
         merged: Dict[str, Any] = dict(state_dict)
 
@@ -340,38 +360,51 @@ class LangGraphService:
                 yield line
             return
 
-        try:
-            try:
-                async for event in astream_events_fn(state_dict, config, version="v2"):
-                    _merge_astream_v2_event(event, merged)
-                    if _should_emit_astream_event(event, self._graph_node_names):
-                        yield json.dumps(
-                            {
-                                "type": "event",
-                                "payload": _json_safe(event),
-                                "state": _json_safe(merged),
-                            }
-                        ) + "\n"
-            except TypeError:
-                async for event in astream_events_fn(state_dict, config):
-                    _merge_astream_v2_event(event, merged)
-                    if _should_emit_astream_event(event, self._graph_node_names):
-                        yield json.dumps(
-                            {
-                                "type": "event",
-                                "payload": _json_safe(event),
-                                "state": _json_safe(merged),
-                            }
-                        ) + "\n"
-        except Exception as e:
-            # Do not fall back to graph.stream here — that would run the workflow a second time.
-            logger.exception("astream_events failed")
-            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
-            return
+        with langfuse_tracer.traced_run(
+            wf.session_id, name=type(wf).__name__, tags=[type(wf).__name__, "stream"]
+        ) as handler:
+            config: Dict[str, Any] = {
+                "configurable": {"thread_id": wf.session_id},
+                "recursion_limit": wf.recursion_limit,
+            }
+            if handler is not None:
+                config["callbacks"] = [handler]
 
-        merged = await asyncio.to_thread(self._finalize_merged_from_graph, graph, config, merged)
-        api = self._state_to_api_response(merged)
-        yield json.dumps({"type": "done", "result": api}) + "\n"
+            try:
+                try:
+                    async for event in astream_events_fn(state_dict, config, version="v2"):
+                        _merge_astream_v2_event(event, merged)
+                        if _should_emit_astream_event(event, self._graph_node_names):
+                            yield json.dumps(
+                                {
+                                    "type": "event",
+                                    "payload": _json_safe(event),
+                                    "state": _json_safe(merged),
+                                }
+                            ) + "\n"
+                except TypeError:
+                    async for event in astream_events_fn(state_dict, config):
+                        _merge_astream_v2_event(event, merged)
+                        if _should_emit_astream_event(event, self._graph_node_names):
+                            yield json.dumps(
+                                {
+                                    "type": "event",
+                                    "payload": _json_safe(event),
+                                    "state": _json_safe(merged),
+                                }
+                            ) + "\n"
+            except Exception as e:
+                # Do not fall back to graph.stream here — that would run the workflow a second time.
+                logger.exception("astream_events failed")
+                yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+                return
+
+            # OTEL context does not cross the to_thread boundary, so the root span is
+            # still active on this coroutine — attach the final merged state here.
+            merged = await asyncio.to_thread(self._finalize_merged_from_graph, graph, config, merged)
+            langfuse_tracer.record_output(_json_safe(merged))
+            api = self._state_to_api_response(merged)
+            yield json.dumps({"type": "done", "result": api}) + "\n"
 
     def get_workflow_status(self) -> Dict[str, Any]:
         try:
@@ -463,6 +496,7 @@ class LangGraphService:
                 structured_output=runtime.config.structured_output,
                 max_tokens=generation_config["max_tokens"],
                 bind_max_tokens=runtime.config.bind_max_tokens,
+                structured_output_method=raw_model_config.get("structured_output_method"),
             )
             runtime.agent = runtime.config.agent_cls(
                 runtime.chain,
@@ -527,11 +561,16 @@ class LangGraphService:
 
         # Refresh the stream allow-list from the real compiled graph so any
         # workflow shape (new nodes, renamed nodes) streams without editing the
-        # _WORKFLOW_GRAPH_NODES constant. Synthetic __start__/__end__ excluded.
+        # _WORKFLOW_GRAPH_NODES constant. Synthetic __start__/__end__ excluded,
+        # as are DeepAgents middleware hook nodes (named ``Class.hook`` — they
+        # carry a ``.`` and are internal plumbing, not user-facing steps); their
+        # state updates still merge into the cumulative ``state`` payload.
         try:
             nodes = self.workflow.graph.get_graph().nodes
             names = frozenset(
-                str(n) for n in nodes if not str(n).startswith("__")
+                str(n)
+                for n in nodes
+                if not str(n).startswith("__") and "." not in str(n)
             )
             self._graph_node_names = names or _WORKFLOW_GRAPH_NODES
         except Exception:

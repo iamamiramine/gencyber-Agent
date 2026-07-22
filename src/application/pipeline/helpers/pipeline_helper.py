@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Set
 
 import yaml
 
+from core.agents.deep_generative_agent import DeepGenerativeAgent
 from core.agents.generative_agent import GenerativeAgent
 from domain.models.langchain.langchain_models import LoadModelParameters, PipelineParameters
 from domain.models.langgraph.agents_models import AgentConfig
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_CLASS_REGISTRY: Dict[str, type] = {
     "GenerativeAgent": GenerativeAgent,
+    "DeepGenerativeAgent": DeepGenerativeAgent,
 }
 
 STRUCTURED_OUTPUT_REGISTRY: Dict[str, type] = {

@@ -1,4 +1,4 @@
-from langchain_core.prompts.chat import (
+from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     AIMessage,

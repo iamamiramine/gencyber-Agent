@@ -30,6 +30,12 @@ def _compose_script_output_for_agent(result: Dict[str, Any]) -> str:
     stderr = result.get("stderr")
     if stderr:
         return stderr
+    # Infrastructure-level failures (a busy PTY session, transport errors) report
+    # on an ``error`` field with empty stdout/stderr. Surface it so a rejected or
+    # failed call is never a silent blank turn the agent misreads as "no output".
+    error = result.get("error")
+    if error:
+        return f"[workbench] {error}"
     return ""
 
 

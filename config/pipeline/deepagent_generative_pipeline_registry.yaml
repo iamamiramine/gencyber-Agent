@@ -1,0 +1,7 @@
+name: deep generative agent (tool-calling)
+
+graph: DeepGenerativeWorkflow
+
+agents:
+  - name: generative
+    config_path: config/agents/deep_generative_agent_config.yaml

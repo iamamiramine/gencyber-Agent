@@ -1,0 +1,9 @@
+name: deep planner agent (hierarchical, tool-calling)
+
+graph: DeepPlannerWorkflow
+
+agents:
+  - name: planner
+    config_path: config/agents/deep_planner_agent_config.yaml
+  - name: generative
+    config_path: config/agents/deep_generative_agent_config.yaml

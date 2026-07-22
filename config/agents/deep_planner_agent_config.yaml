@@ -1,0 +1,41 @@
+Agent_Config:
+  name: planner
+  prompt_key: deep_planner_agent
+  structured_output_key: GenerativeAgentResponse
+  agent_class_key: DeepGenerativeAgent
+  share_history_key: shared_execution
+  bind_max_tokens: true
+  base_path: "./config/"
+  extra_prompt_kwargs: {}
+
+Model_Params:
+  provider: openrouter
+  model_name: openai/gpt-4o-mini
+  model_path: openai/gpt-4o-mini
+  max_retries: 5  # SDK-level exponential backoff absorbs transient provider connection blips
+  base_url: null
+
+Pipeline_Params:
+  task_type: text-generation
+  max_new_tokens: 2048
+  do_sample: false
+  temperature: 0.2
+  top_p: 0.95
+  top_k: 40
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+  frequency_penalty: 0.0
+  no_repeat_ngram_size: 3
+  load_playbooks: true
+  load_snippets: true
+  load_context: true
+
+Generation_Config:
+  temperature: 0.2
+  top_p: 0.95
+  top_k: 40
+  max_tokens: 2048
+  repetition_penalty: 1.0
+  presence_penalty: 0.0
+  frequency_penalty: 0.0
+  no_repeat_ngram_size: 3

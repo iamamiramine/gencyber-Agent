@@ -5,7 +5,7 @@ import json
 import logging
 from typing import Annotated, Any, Dict, Optional, TypedDict
 
-from langchain_core.prompts.chat import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from core.agents.base_agent_state_spec import BaseStatefulAgent
 from infrastructure.services.memory_logger_service import get_memory_logger
@@ -77,12 +77,12 @@ class GenerativeAgent(BaseStatefulAgent):
 
         self.chat_history.clear()
         for goal_content in self.persistent_submitted_goals:
-            try:
-                self.chat_history.add_ai_message(
-                    AIMessage(content=json.loads(goal_content))
-                )
-            except json.JSONDecodeError:
-                self.chat_history.add_ai_message(AIMessage(content=goal_content))
+            # ``goal_content`` is the JSON *string* the goal was stored as (see the
+            # ``startswith('{"submitted_goal":')`` guard above and the producer in
+            # ``__call__``). Re-add it verbatim — ``AIMessage.content`` must be a str
+            # (or list), so ``json.loads`` here would yield a dict and raise a
+            # pydantic ValidationError, erroring the turn and looping the graph.
+            self.chat_history.add_ai_message(AIMessage(content=goal_content))
 
     def _build_system_prompt(self, state: Dict[str, Any]) -> str:
         """Resolve the system prompt for this turn."""
@@ -99,7 +99,13 @@ class GenerativeAgent(BaseStatefulAgent):
         self.clear_chat_history_except_persistent()
         return (view.query or "").strip(), False
 
-    def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def __call__(
+        self, state: Dict[str, Any], config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        # ``config`` is injected by LangGraph (it carries the Langfuse CallbackHandler
+        # set on the run config). Threading it into the inner ``self.llm.invoke`` is
+        # what makes the baseline agent's LLM call show up as a child span; without
+        # it the call would not inherit the parent run's callbacks.
         view = self.read_state(state)
         query = view.query or ""
         if not query.strip():
@@ -118,7 +124,8 @@ class GenerativeAgent(BaseStatefulAgent):
             history_with_memory = self.format_chat_history(self.chat_history)
 
             structured_response = self.llm.invoke(
-                {"system": system_base, "history": history_with_memory}
+                {"system": system_base, "history": history_with_memory},
+                config=config,
             )
 
             logger.info("GENERATIVE_AGENT_RESPONSE %s", structured_response)

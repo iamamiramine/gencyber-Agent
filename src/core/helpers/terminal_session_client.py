@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 
 import requests
 
+from infrastructure.observability.langfuse_tracer import observe
+
 
 def _terminal_base_url() -> str:
     return os.getenv("TERMINAL_SESSION_URL", "http://gencyber-workbench:3000").strip().rstrip("/")
@@ -32,6 +34,7 @@ def ensure_terminal_session(
         return {"success": False, "error": str(e)}
 
 
+@observe(name="pty-execute")
 def execute_in_terminal_session(
     command: str,
     session_id: str = "default",

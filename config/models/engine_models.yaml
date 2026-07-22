@@ -1,0 +1,34 @@
+# gencyber-Engine model catalog
+# =============================================================================
+# The list of model names served by gencyber-Engine (our local vLLM /
+# OpenAI-compatible server). It is the SINGLE place that decides "load this model
+# from OpenRouter or from gencyber-Engine": if a run's model_name appears here, the
+# agent routes it to the engine; otherwise it goes to OpenRouter. See
+# langraph_helpers.resolve_engine_target.
+#
+# Choosing which model a RUN uses is done in config/agents (model_name) or per-run via
+# the API / frontend / experiment script — not here. Pipeline configs are never edited
+# for model changes.
+#
+# Each name MUST be byte-identical to (1) the engine's --served-model-name and (2) what
+# the frontend / --model sends. A vLLM instance serves ONE model, so the tiered design
+# (small subagent + big orchestrator running at once) needs TWO instances → the two
+# tiers below carry different base_urls (see gencyber-Engine/docker-compose.yaml:
+# `gencyber-engine` = orchestrator tier, `gencyber-engine-sub` = subagent tier).
+default_base_url: http://gencyber-engine:8000/v1
+
+models:
+  # ── Orchestrator / escalation tier (big; primary engine instance) ─────────────
+  # vLLM tool-call parser: hermes (Qwen), gemma4 (Gemma) — set in the engine .env.
+  - Qwen/Qwen3.6-27B                 # Qwen orchestrator (dense 27B), parser=hermes
+  - google/gemma-4-31B-it            # Gemma orchestrator (dense 31B), parser=gemma4
+
+  # ── Subagent tier (small; second engine instance) ────────────────────────────
+  - name: Qwen/Qwen3-8B              # Qwen subagent (dense 8B), parser=hermes
+    base_url: http://gencyber-engine-sub:8000/v1
+  - name: google/gemma-4-12B-it      # Gemma subagent (12B), parser=gemma4
+    base_url: http://gencyber-engine-sub:8000/v1
+
+  # ── Small Qwen for a single-GPU / laptop smoke test (primary instance) ────────
+  - Qwen/Qwen2.5-1.5B-Instruct
+  - Qwen/Qwen2.5-0.5B-Instruct

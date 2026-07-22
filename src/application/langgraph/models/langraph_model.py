@@ -11,12 +11,13 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.generative_agent import GenerativeAgentState
+from infrastructure.observability import langfuse_tracer
 from infrastructure.repository.mongodb_repository import get_mongodb_client
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_GENERATION_CYCLE_MAX = 60
-_DEFAULT_RECURSION_LIMIT = 300
+_DEFAULT_RECURSION_LIMIT = int(os.getenv("GENCYBER_RECURSION_LIMIT", "300"))
 
 
 def _routing_state_view(state: Any) -> Dict[str, Any]:
@@ -116,8 +117,7 @@ class WorkflowGraph:
 
         self.graph = self.create_graph()
 
-    def _route_after_generation(self, state: Dict[str, Any]) -> str:
-        s = _routing_state_view(state)
+    def _decide_after_generation(self, s: Dict[str, Any]) -> str:
         if bool(s.get("submission_verified")):
             return "end"
         sg = s.get("submitted_goal")
@@ -133,11 +133,30 @@ class WorkflowGraph:
         # tries again; only a verified submission ends the run.
         return "continue"
 
+    def _route_after_generation(self, state: Dict[str, Any]) -> str:
+        s = _routing_state_view(state)
+        decision = self._decide_after_generation(s)
+        # Conditional-edge functions are not runnables, so the callback bus never sees
+        # them — emit the routing decision as a trace event explicitly.
+        langfuse_tracer.record_event(
+            "route-after-generation",
+            decision=decision,
+            has_submitted_goal=bool(str(s.get("submitted_goal") or "").strip()),
+            has_command=bool(str(s.get("command") or "").strip()),
+            has_write_script=bool(str(s.get("write_script") or "").strip()),
+            submission_verified=bool(s.get("submission_verified")),
+        )
+        return decision
+
     def _route_after_submit(self, state: Dict[str, Any]) -> str:
         s = _routing_state_view(state)
-        if bool(s.get("submission_verified")):
-            return "end"
-        return "continue"
+        decision = "end" if bool(s.get("submission_verified")) else "continue"
+        langfuse_tracer.record_event(
+            "route-after-submit",
+            decision=decision,
+            submission_verified=bool(s.get("submission_verified")),
+        )
+        return decision
 
     def _wire_state_graph(self) -> StateGraph:
         """Wire nodes/edges of the (uncompiled) ``StateGraph``.
@@ -258,11 +277,19 @@ class WorkflowGraph:
         logger.info("Invoking agent graph query=%s", query)
         state_dict = self._build_initial_state(query=query)
         try:
-            config = {
-                "configurable": {"thread_id": self.session_id},
-                "recursion_limit": self.recursion_limit,
-            }
-            final_state = self.graph.invoke(state_dict, config=config)
+            with langfuse_tracer.traced_run(
+                self.session_id,
+                name=type(self).__name__,
+                tags=[type(self).__name__, "invoke"],
+            ) as handler:
+                config: Dict[str, Any] = {
+                    "configurable": {"thread_id": self.session_id},
+                    "recursion_limit": self.recursion_limit,
+                }
+                if handler is not None:
+                    config["callbacks"] = [handler]
+                final_state = self.graph.invoke(state_dict, config=config)
+                langfuse_tracer.record_output(final_state)
             print("FINAL_STATE", final_state, flush=True)
             logger.info("Workflow execution completed")
             return final_state
@@ -276,3 +303,15 @@ class WorkflowGraph:
 GRAPH_REGISTRY: Dict[str, Any] = {
     "WorkflowGraph": WorkflowGraph,
 }
+
+# Registered after WorkflowGraph + serialize_graph_topology are defined so the deep
+# workflow modules can import serialize_graph_topology without an import cycle.
+from application.langgraph.models.deep_generative_workflow import (  # noqa: E402
+    DeepGenerativeWorkflow,
+)
+from application.langgraph.models.deep_planner_workflow import (  # noqa: E402
+    DeepPlannerWorkflow,
+)
+
+GRAPH_REGISTRY["DeepGenerativeWorkflow"] = DeepGenerativeWorkflow
+GRAPH_REGISTRY["DeepPlannerWorkflow"] = DeepPlannerWorkflow

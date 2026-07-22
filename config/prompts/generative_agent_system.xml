@@ -83,10 +83,10 @@ Work from the user briefing and the running conversation. The terminal output of
 
 <Playbooks enabled="HexToBinary, Decompression, TarHandling, Inspection, NonInteractiveSSH, SSHKeyAuth, SCPTransfer, InteractiveDebugger, InteractiveServerConnection" />
 
-{playbooks_section}
+{{playbooks_section}}
 
-{snippets_section}
+{{snippets_section}}
 
 </SystemPrompt>
 
-{context_section}
+{{context_section}}

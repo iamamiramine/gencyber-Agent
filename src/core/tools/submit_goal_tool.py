@@ -159,7 +159,22 @@ class BaseSubmitGoalTool:
                 ),
             )
         else:
-            validation = self._validate(state, submitted)
+            # Deterministic flag-shape guard (consolidated-experiment F1/F5/F6/W4):
+            # reject values that are obviously not a flag — a filename, URL, address,
+            # multi-sentence report prose, or the wrong wrapper — before any oracle
+            # call. ``flag_format`` is optional (read from state when the caller
+            # supplied it); when absent, only format-agnostic shape checks run.
+            from core.tools.flag_shape import classify_flag_candidate
+
+            shape = classify_flag_candidate(
+                submitted, flag_format=state.get("flag_format")
+            )
+            if not shape.ok:
+                validation = SubmitValidationResult(
+                    accepted=False, reason=shape.reason
+                )
+            else:
+                validation = self._validate(state, submitted)
 
         print(
             f"SUBMIT_GOAL_TOOL[{self.label}] candidate_len={len(submitted)} "

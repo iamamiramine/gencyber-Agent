@@ -91,10 +91,10 @@ Skill fields (progressive disclosure — see the <SkillsCatalog> block appended 
 - Keep reasoning concise; spend the token budget on an accurate, evidence-grounded tree.
 </AntiLooping>
 
-{playbooks_section}
+{{playbooks_section}}
 
-{snippets_section}
+{{snippets_section}}
 
 </SystemPrompt>
 
-{context_section}
+{{context_section}}

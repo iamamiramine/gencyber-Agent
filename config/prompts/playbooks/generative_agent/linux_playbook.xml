@@ -63,7 +63,7 @@ PRIORITY POLICY — the workbench terminal is NON-INTERACTIVE. Any command that 
 2. **Key authentication → ``ssh -i <keyfile>`` plus non-interactive options** so it never silently falls back to a password prompt:
    - ``ssh -i ./keyfile -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p <port> <user>@<host> '<remote command>'``
 3. **Always** pass ``-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`` on EVERY ssh/scp so the first-connect host-key question never blocks.
-4. **Run remote work as a single non-interactive command**: ``ssh ... <user>@<host> '<command>'``. Never open an interactive remote shell and "type" into it. To run several remote steps, chain them in one quoted command: ``ssh ... <user>@<host> 'cd /x; ls; cat flag.txt'``.
+4. **Run remote work as a single non-interactive command**: ``ssh ... <user>@<host> '<command>'``. Never open an interactive remote shell and "type" into it. To run several remote steps, chain them in one quoted command: ``ssh ... <user>@<host> 'cd /x; ls; cat file.txt'``.
 5. **Forbidden**: bare ``ssh <user>@<host>`` / ``scp`` against a password host; interactive remote shells; ssh/scp missing the StrictHostKeyChecking + UserKnownHostsFile options; and relying on typing a password at a prompt. If you have a password but no key file, ``sshpass`` is the only allowed path.
 </Playbook>
 

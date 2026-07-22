@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from typing import Optional, Tuple
 
+from infrastructure.observability.langfuse_tracer import observe
+
 
 def _workbench_base() -> str:
     return (
@@ -24,6 +26,7 @@ def _workbench_base() -> str:
     ).rstrip("/")
 
 
+@observe(name="flag-validation")
 def validate_submission_remote(
     *,
     session_id: str,

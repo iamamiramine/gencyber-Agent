@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Any, Optional, List
 
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
