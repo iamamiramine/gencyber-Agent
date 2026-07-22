@@ -182,6 +182,34 @@ def _apply_model_override(
     return merged
 
 
+def _apply_per_agent_models(rt: Dict[str, Any], agent_models: Dict[str, str]) -> Dict[str, Any]:
+    """Override specific agents' model fields by registry name (others keep their config).
+
+    Enables tiered runs (e.g. planner=27B, generative/subagent=8B) without editing YAML.
+    Model routing (OpenRouter vs gencyber-Engine) is still decided by the name.
+    """
+    from application.pipeline.helpers import pipeline_helper as ph
+
+    new_raw = dict(rt["model_config_raw"])
+    new_mp = dict(rt["model_params"])
+    new_pp = dict(rt["pipeline_params"])
+    for agent, model in agent_models.items():
+        if not model or agent not in rt["model_config_raw"]:
+            continue
+        rc = dict(rt["model_config_raw"][agent])
+        rc["model_name"] = model
+        rc["model_path"] = ph.resolve_model_path(model)
+        new_raw[agent] = rc
+        new_mp[agent] = ph.build_model_params(rc)
+        try:
+            new_pp[agent] = rt["pipeline_params"][agent].model_copy(update={"model_name": model})
+        except Exception:
+            new_pp[agent] = rt["pipeline_params"][agent]
+    merged = dict(rt)
+    merged.update(model_params=new_mp, model_config_raw=new_raw, pipeline_params=new_pp)
+    return merged
+
+
 def _build_service(
     registry_id: Optional[str],
     model_name: Optional[str],
@@ -189,6 +217,7 @@ def _build_service(
     session_id: str,
     escalation_model: Optional[str] = None,
     escalation_after_actions: Optional[int] = None,
+    agent_models: Optional[Dict[str, str]] = None,
 ):
     """Initialize a LangGraphService for one run (replicates the init endpoint)."""
     from application.langgraph.services.langgraph_service import LangGraphService
@@ -198,6 +227,8 @@ def _build_service(
     rt = PipelineConfigService(registry_path=str(_resolve_registry_path(registry_id))).load_runtime_config()
     if model_name:
         rt = _apply_model_override(rt, model_name=model_name, provider=provider)
+    if agent_models:
+        rt = _apply_per_agent_models(rt, agent_models)
 
     service = LangGraphService()
     resp = service.init_workflow(
@@ -335,6 +366,7 @@ def make_task(
     start_services: bool,
     escalation_model: Optional[str] = None,
     escalation_after_actions: Optional[int] = None,
+    agent_models: Optional[Dict[str, str]] = None,
 ):
     """Build the per-item task: materialize → start → run agent → stop."""
 
@@ -406,6 +438,7 @@ def make_task(
                 registry_id, model_name, provider, session_id,
                 escalation_model=escalation_model,
                 escalation_after_actions=escalation_after_actions,
+                agent_models=agent_models,
             )
             final_state = service.workflow.invoke(
                 query=_compose_question(mat, svc, category=inp.get("category"))
@@ -521,6 +554,8 @@ def main() -> int:
     pr.add_argument("--provider", default=None, help="force provider (openrouter/openai/ollama); normally unnecessary — the model name decides")
     pr.add_argument("--escalation-model", default=None, help="per-run escalation target (model name; routes to engine/OpenRouter by name; 'off' disables). Default: GENCYBER_ESCALATION_MODEL env")
     pr.add_argument("--escalation-after-actions", type=int, default=None, help="actions-without-a-flag that trip a stall escalation (env default 12)")
+    pr.add_argument("--planner-model", default=None, help="tiered runs: model for the planner/orchestrator agent (overrides its config)")
+    pr.add_argument("--subagent-model", default=None, help="tiered runs: model for the generative/subagent (overrides its config)")
     pr.add_argument("--local", action="store_true", help="run off freshly-enumerated data, not a Langfuse dataset")
     pr.add_argument("--no-services", action="store_true", help="skip start/stop of challenge docker services")
     pr.add_argument("--judge", action="store_true", help="include the LLM reasoning-quality evaluator")
@@ -560,6 +595,12 @@ def main() -> int:
     evaluators = list(DEFAULT_ITEM_EVALUATORS)
     if args.judge or os.getenv("GENCYBER_EVAL_LLM_JUDGE"):
         evaluators.append(make_reasoning_quality_evaluator())
+    agent_models: Dict[str, str] = {}
+    if args.planner_model:
+        agent_models["planner"] = args.planner_model
+    if args.subagent_model:
+        agent_models["generative"] = args.subagent_model
+
     task = make_task(
         base=base,
         registry_id=args.registry,
@@ -569,9 +610,12 @@ def main() -> int:
         start_services=not args.no_services,
         escalation_model=args.escalation_model,
         escalation_after_actions=args.escalation_after_actions,
+        agent_models=agent_models or None,
     )
     run_metadata = {
         "model": args.model or "registry-default",
+        "planner_model": args.planner_model or "config-default",
+        "subagent_model": args.subagent_model or "config-default",
         "escalation_model": args.escalation_model or "env-default",
         "registry": args.registry or "default",
         "benchmark": args.benchmark,
