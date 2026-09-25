@@ -18,7 +18,10 @@ from application.langgraph.helpers.langraph_helpers import (
 from application.langgraph.models.langraph_model import (
     GRAPH_REGISTRY,
 )
-from application.langgraph.models.deep_generative_workflow import set_escalation_config
+from application.langgraph.models.deep_generative_workflow import (
+    set_escalation_config,
+    set_skill_scope,
+)
 from core.helpers.chat_history_helper import ChatHistoryFormatter
 from core.tools.script_execution_tool import ExecuteScriptTool
 from core.tools.submit_goal_tool import BaseSubmitGoalTool, build_submit_goal_tool
@@ -172,6 +175,7 @@ class LangGraphService:
         escalation_after_actions: Optional[int] = None,
         escalation_provider: Optional[str] = None,
         escalation_base_url: Optional[str] = None,
+        challenge_category: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
             if agent_definitions is None:
@@ -208,6 +212,10 @@ class LangGraphService:
                 provider=escalation_provider,
                 base_url=escalation_base_url,
             )
+            # Per-run skill scope. Same ordering constraint as the escalation config:
+            # it must be recorded before _build_workflow, which is where the monolith
+            # picks its pack and folds that pack's SKILL.md into the system prompt.
+            set_skill_scope(session_id, category=challenge_category)
 
             self._initialize_histories(history_keys or [])
             self._initialize_agent_runtimes()

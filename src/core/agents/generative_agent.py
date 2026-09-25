@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Annotated, Any, Dict, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage
 
 from core.agents.base_agent_state_spec import BaseStatefulAgent
+from core.helpers.history_bound import message_chars
 from infrastructure.services.memory_logger_service import get_memory_logger
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,56 @@ class GenerativeAgent(BaseStatefulAgent):
             chat_history, self.generation_config["model_name"]
         )
 
+    def _bound_history(self) -> None:
+        """Trim the oldest turns so the formatted history stays under the model's
+        context / provider payload limit — the single-agent analogue of the deep
+        planner's ``HistoryBoundMiddleware`` (same ``GENCYBER_MAX_HISTORY_CHARS`` /
+        ``GENCYBER_HISTORY_KEEP_RECENT`` budget, for equal footing).
+
+        Without it, a long ReAct spiral accumulates history unbounded and the request
+        eventually exceeds the provider payload limit (HTTP 413 / "text input exceeds
+        8 MB"), which either wedges the run in a retry storm or OOM-kills it. Messages
+        here are plain Human/AI text (no tool_call/tool_result pairing), so cutting the
+        oldest middle turns is always safe. Always keeps ``messages[0]`` (the briefing)
+        and the most recent ``keep_recent`` messages. Fail-open: any error leaves the
+        history untouched. ``0`` disables it."""
+        try:
+            limit = int(os.getenv("GENCYBER_MAX_HISTORY_CHARS", "120000"))
+            keep_recent = int(os.getenv("GENCYBER_HISTORY_KEEP_RECENT", "12"))
+            msg_cap = int(os.getenv("GENCYBER_MAX_MSG_CHARS", "24000"))
+            msgs = self.chat_history.messages
+            # 1) Per-message cap: a SINGLE huge tool output (e.g. `strings`/`hexdump` of a
+            #    big binary, a base64 blob) can exceed the provider payload limit (8 MB)
+            #    all by itself, so trimming the *count* of messages is not enough — cap each
+            #    message's size too. Keep the head (where the useful signal usually is) and
+            #    a small tail, with a marker. Mirrors the deep planner's evidence cap.
+            if msg_cap > 0:
+                for m in msgs:
+                    c = getattr(m, "content", None)
+                    if isinstance(c, str) and len(c) > msg_cap:
+                        head = c[: max(msg_cap - 2000, 0)]
+                        tail = c[-2000:]
+                        try:
+                            m.content = f"{head}\n...[truncated {len(c) - msg_cap} chars]...\n{tail}"
+                        except Exception:
+                            pass
+            # 2) Total-size trim: drop the oldest middle turns, keep briefing + recent suffix.
+            if limit <= 0 or len(msgs) <= keep_recent + 1:
+                return
+            if sum(message_chars(m) for m in msgs) <= limit:
+                return
+            kept = [msgs[0]] + msgs[-keep_recent:]
+            dropped = len(msgs) - len(kept)
+            if dropped <= 0:
+                return
+            self.chat_history.messages[:] = kept
+            print(
+                f"HISTORY_BOUND[trim] dropping {dropped} of {len(msgs)} messages",
+                flush=True,
+            )
+        except Exception as e:  # pragma: no cover - must never break a run
+            print(f"HISTORY_BOUND[error] {e}", flush=True)
+
     def clear_chat_history_except_persistent(self) -> None:
         """Wipe the per-turn working memory but keep any recovered submission."""
         for message in self.chat_history.messages:
@@ -121,6 +173,7 @@ class GenerativeAgent(BaseStatefulAgent):
             system_base = self._build_system_prompt(state)
 
             self.chat_history.add_user_message(HumanMessage(content=query_to_process))
+            self._bound_history()
             history_with_memory = self.format_chat_history(self.chat_history)
 
             structured_response = self.llm.invoke(

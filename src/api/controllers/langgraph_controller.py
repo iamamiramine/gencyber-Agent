@@ -83,6 +83,16 @@ class WorkflowInitParams(BaseModel):
         default=None,
         description="Optional base URL for the escalation model (else inherits the base model's).",
     )
+    challenge_category: Optional[str] = Field(
+        default=None,
+        description=(
+            "Challenge category hint ('crypto', 'rev', 'pwn', 'misc', 'web', "
+            "'forensics', ...). Scopes the monolithic (M0/M1) agent's skill access to "
+            "the matching ctf-* pack, so it sees exactly the corpus one planner "
+            "specialist would. Ignored by the planner graph, whose specialists are "
+            "already one-pack-per-agent. Omit for non-benchmark runs."
+        ),
+    )
     tools: Optional[List[str]] = Field(
         default=None,
         description=(
@@ -227,6 +237,7 @@ def init_workflow(workflow_init_params: Optional[WorkflowInitParams] = None) -> 
             escalation_after_actions=params.escalation_after_actions,
             escalation_provider=params.escalation_provider,
             escalation_base_url=params.escalation_base_url,
+            challenge_category=params.challenge_category,
         )
     except Exception as e:
         logger.exception("Unexpected controller error during workflow initialization")

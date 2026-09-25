@@ -15,6 +15,9 @@ Model_Params:
   # bit_quantization: 8
   max_retries: 1
   base_url: null
+  # Guided-JSON structured output (no native tool-calling) so it works on a vLLM
+  # started WITHOUT --enable-auto-tool-choice (e.g. the RunPod vLLM Latest pod).
+  structured_output_method: json_schema
 
 Pipeline_Params:
   task_type: text-generation

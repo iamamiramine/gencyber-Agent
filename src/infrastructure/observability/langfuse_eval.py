@@ -205,7 +205,10 @@ def make_reasoning_quality_evaluator(
     def reasoning_quality(*, output: Any = None, **_: Any) -> Evaluation:
         reasoning = (output or {}).get("reasoning") if isinstance(output, dict) else None
         if not reasoning or not api_key:
-            return Evaluation(name="reasoning_quality", value=None, comment="n/a (no judge/reasoning)")
+            # Return None, not Evaluation(value=None): ScoreBody rejects a null value
+            # and the raised ValidationError kills the run BEFORE Langfuse registers
+            # anything -- the run executes, solves, and leaves no trace at all.
+            return None
         solved_flag = bool(isinstance(output, dict) and output.get("submission_verified"))
         score, comment = _judge_reasoning(reasoning, solved_flag, model, api_key, base_url)
         return Evaluation(name="reasoning_quality", value=score, comment=comment)
@@ -275,13 +278,17 @@ def _values(item_results: Any, name: str) -> List[float]:
 
 def solve_rate(*, item_results: Any = None, **_: Any) -> Evaluation:
     vals = _values(item_results, "solved")
-    avg = sum(vals) / len(vals) if vals else None
+    if not vals:
+        return None          # null value -> ScoreBody ValidationError -> lost run
+    avg = sum(vals) / len(vals)
     return Evaluation(name="solve_rate", value=avg, comment=f"{sum(vals):.0f}/{len(vals)} solved")
 
 
 def delegation_accuracy(*, item_results: Any = None, **_: Any) -> Evaluation:
     vals = _values(item_results, "correct_subagent")
-    avg = sum(vals) / len(vals) if vals else None
+    if not vals:
+        return None
+    avg = sum(vals) / len(vals)
     return Evaluation(
         name="delegation_accuracy",
         value=avg,
@@ -296,7 +303,9 @@ def mean_commands(*, item_results: Any = None, **_: Any) -> Evaluation:
         if isinstance(getattr(r, "output", None), dict)
         and isinstance(r.output.get("num_commands"), (int, float))
     ]
-    avg = sum(counts) / len(counts) if counts else None
+    if not counts:
+        return None
+    avg = sum(counts) / len(counts)
     return Evaluation(name="mean_commands", value=avg, comment=f"over {len(counts)} runs")
 
 

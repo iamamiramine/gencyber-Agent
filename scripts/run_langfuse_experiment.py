@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -143,9 +144,31 @@ def _item_input(item: Any) -> Dict[str, Any]:
     return item.input if hasattr(item, "input") else item["input"]
 
 
+def _dataset_item_cid(item: Any) -> Optional[str]:
+    """challenge_id of a Langfuse DatasetItem.
+
+    Items are created with ``id=challenge_id`` and ``input.challenge_id`` (see
+    ``sync_dataset``); prefer the input field and fall back to the item id.
+    """
+    inp = getattr(item, "input", None)
+    if isinstance(inp, dict) and inp.get("challenge_id"):
+        return inp["challenge_id"]
+    return getattr(item, "id", None)
+
+
 # ---------------------------------------------------------------------------
 # In-process agent run
 # ---------------------------------------------------------------------------
+def _has_specialists(registry_id: Optional[str]) -> bool:
+    """Does this registry build a planner with ctf-* specialist subagents?
+
+    Drives the wording of the category hint (``_compose_question``). Only the planner
+    registry has specialists to delegate to; the deep *generative* registry (M0/M1)
+    and the baseline single-agent registry do not.
+    """
+    return "planner" in (registry_id or "").lower()
+
+
 def _resolve_registry_path(registry_id: Optional[str]) -> Path:
     base = os.getenv("REGISTRY_PATH", "config/pipeline/default_pipeline_registry.yaml")
     if not registry_id:
@@ -218,6 +241,7 @@ def _build_service(
     escalation_model: Optional[str] = None,
     escalation_after_actions: Optional[int] = None,
     agent_models: Optional[Dict[str, str]] = None,
+    challenge_category: Optional[str] = None,
 ):
     """Initialize a LangGraphService for one run (replicates the init endpoint)."""
     from application.langgraph.services.langgraph_service import LangGraphService
@@ -245,6 +269,9 @@ def _build_service(
         # None → falls back to the GENCYBER_ESCALATION_MODEL env default.
         escalation_model=escalation_model,
         escalation_after_actions=escalation_after_actions,
+        # Scopes the monolith's skill access to this challenge's pack, so M sees the
+        # same corpus one planner specialist would. The planner ignores it.
+        challenge_category=challenge_category,
     )
     if isinstance(resp, dict) and resp.get("error"):
         raise RuntimeError(f"init_workflow failed: {resp['error']}")
@@ -255,15 +282,25 @@ def _build_service(
 
 
 def _compose_question(
-    mat: Dict[str, Any], svc: Dict[str, Any], category: Optional[str] = None
+    mat: Dict[str, Any],
+    svc: Dict[str, Any],
+    category: Optional[str] = None,
+    *,
+    has_specialists: bool = True,
 ) -> str:
     """Build the briefing from the workbench seed prompt + reachable endpoints.
 
     When the benchmark exposes the challenge ``category`` we append it as an explicit
-    routing hint so the planner delegates to the matching specialist first instead of
-    mis-classifying (observed 36% mis-delegation, with a wasted ``ctf-osint`` triage
-    step). Only the category is added — never the challenge/file name (prompt-hygiene
-    rule). For non-benchmark use where no category is known, this is simply omitted.
+    hint so the agent does not mis-classify the challenge (observed 36%
+    mis-delegation, with a wasted ``ctf-osint`` triage step). Only the category is
+    added — never the challenge/file name (prompt-hygiene rule). For non-benchmark use
+    where no category is known, this is simply omitted.
+
+    The hint's *wording* must match the topology, or the control is not matched. The
+    planner is told to delegate; a monolith has nobody to delegate to, so telling it
+    to would be an instruction it cannot follow — a silent handicap dressed up as
+    parity. ``has_specialists=False`` swaps in the equivalent wording for a single
+    agent: same category information, same emphasis, no delegation verb.
     """
     seed = (mat.get("seed_prompt") or "").strip()
     if not seed:
@@ -281,11 +318,18 @@ def _compose_question(
         seed += f"\n\nReachable challenge services:\n{lines}"
     cat = (category or "").strip()
     if cat:
-        seed += (
-            f"\n\nChallenge category (routing hint): {cat}. Delegate to the specialist "
-            f"whose remit matches this category first; only switch categories if the "
-            f"evidence you gather clearly contradicts it."
-        )
+        if has_specialists:
+            seed += (
+                f"\n\nChallenge category (routing hint): {cat}. Delegate to the "
+                f"specialist whose remit matches this category first; only switch "
+                f"categories if the evidence you gather clearly contradicts it."
+            )
+        else:
+            seed += (
+                f"\n\nChallenge category (routing hint): {cat}. Treat this as a {cat} "
+                f"challenge and start from the techniques that category implies; only "
+                f"change course if the evidence you gather clearly contradicts it."
+            )
     return seed
 
 
@@ -372,17 +416,25 @@ def make_task(
 
     # Shared across items in this run. Two provider-health failure modes abort the run
     # early so a systemic outage can't silently null dozens of challenges (a real
-    # OpenRouter connection outage once wiped 34/57 this way, each failing instantly
-    # with 0 attempts):
+    # OpenRouter connection outage once wiped 34/57 this way — and later 178/200 —
+    # each failing instantly with 0 attempts):
     #   * credits exhausted (HTTP 402) — every remaining item would 402 the same way;
-    #   * repeated connection errors — the provider is unreachable; stop after
-    #     ``_CONN_ABORT_AFTER`` consecutive failures (a single healthy item resets the
-    #     streak, so a brief blip doesn't abort).
+    #   * repeated connection errors — the provider is unreachable. Each item first
+    #     absorbs a blip itself: on a connection error it retries the SAME challenge
+    #     with exponential backoff (``_CONN_RETRIES`` times) before giving up. Only a
+    #     challenge that STILL connection-errors after all its retries counts toward
+    #     the abort guard, which trips after ``_CONN_ABORT_AFTER`` such consecutive
+    #     challenges (a single healthy item resets the streak). So aborting now means
+    #     a genuinely sustained outage, not a brief hiccup.
     # Re-running the experiment when the provider is healthy naturally resumes the
-    # unskipped items. Transient per-call blips are absorbed by the model's own
-    # ``max_retries`` (see config) with exponential backoff before it ever reaches here.
+    # unskipped items (session_id is deterministic per run-name+challenge).
     run_state = {"aborted": False, "abort_reason": "", "conn_fails": 0}
     _CONN_ABORT_AFTER = int(os.getenv("EXPERIMENT_CONN_ABORT_AFTER", "3"))
+    # Per-challenge connection-error backoff retry: wait out a transient provider blip
+    # instead of burning the challenge. delay = min(base * 2**attempt, max) seconds.
+    _CONN_RETRIES = max(0, int(os.getenv("EXPERIMENT_CONN_RETRIES", "5")))
+    _CONN_BACKOFF_BASE = float(os.getenv("EXPERIMENT_CONN_BACKOFF_BASE", "30"))
+    _CONN_BACKOFF_MAX = float(os.getenv("EXPERIMENT_CONN_BACKOFF_MAX", "300"))
 
     def _is_credit_error(err: Any) -> bool:
         e = str(err or "").lower()
@@ -434,16 +486,56 @@ def make_task(
                 )
                 project_name = svc.get("project_name")
 
-            service = _build_service(
-                registry_id, model_name, provider, session_id,
-                escalation_model=escalation_model,
-                escalation_after_actions=escalation_after_actions,
-                agent_models=agent_models,
-            )
-            final_state = service.workflow.invoke(
-                query=_compose_question(mat, svc, category=inp.get("category"))
-            )
-            out = _extract_output(final_state, session_id, svc)
+            # Per-challenge backoff retry. A transient provider blip surfaces as a
+            # connection error and fast-fails the item with ~0 work; rather than
+            # counting it toward the abort guard immediately, wait it out and retry the
+            # SAME challenge. A fresh service gives a fresh LLM client (clean
+            # connection); the session_id is unchanged so the flag-oracle binding holds
+            # and the graph resumes from its checkpoint. Credit (402) errors and any
+            # non-connection result (a solve or a genuine failure) are final and break
+            # out immediately — only connection errors are retried.
+            out: Optional[Dict[str, Any]] = None
+            for attempt in range(_CONN_RETRIES + 1):
+                service = _build_service(
+                    registry_id, model_name, provider, session_id,
+                    escalation_model=escalation_model,
+                    escalation_after_actions=escalation_after_actions,
+                    agent_models=agent_models,
+                    challenge_category=inp.get("category"),
+                )
+                try:
+                    final_state = service.workflow.invoke(
+                        query=_compose_question(
+                            mat, svc,
+                            category=inp.get("category"),
+                            has_specialists=_has_specialists(registry_id),
+                        )
+                    )
+                    out = _extract_output(final_state, session_id, svc)
+                except Exception as exc:  # invoke raised instead of returning an error state
+                    if not _is_connection_error(exc):
+                        raise
+                    out = {
+                        "submission_verified": False,
+                        "error": str(exc),
+                        "session_id": session_id,
+                    }
+                err = out.get("error")
+                if _is_credit_error(err) or not _is_connection_error(err):
+                    break  # final: credits won't recover by waiting; a real result stands
+                if attempt < _CONN_RETRIES:
+                    delay = min(_CONN_BACKOFF_BASE * (2 ** attempt), _CONN_BACKOFF_MAX)
+                    logger.warning(
+                        "challenge=%s connection error (attempt %d/%d): %s — retrying in %.0fs",
+                        cid, attempt + 1, _CONN_RETRIES + 1, str(err)[:80], delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "challenge=%s connection error persisted after %d attempts: %s",
+                        cid, _CONN_RETRIES + 1, str(err)[:80],
+                    )
+
             err = out.get("error")
             if _is_credit_error(err):
                 run_state["aborted"] = True
@@ -454,18 +546,21 @@ def make_task(
                     cid,
                 )
             elif _is_connection_error(err):
+                # Only reached after the item exhausted all its backoff retries, so this
+                # is a sustained outage, not a blip.
                 run_state["conn_fails"] += 1
                 logger.error(
-                    "challenge=%s connection error (%d consecutive): %s",
+                    "challenge=%s connection error after %d retries (%d consecutive): %s",
                     cid,
+                    _CONN_RETRIES,
                     run_state["conn_fails"],
                     str(err)[:80],
                 )
                 if run_state["conn_fails"] >= _CONN_ABORT_AFTER:
                     run_state["aborted"] = True
                     run_state["abort_reason"] = (
-                        f"{run_state['conn_fails']} consecutive connection errors "
-                        "(LLM provider appears down)"
+                        f"{run_state['conn_fails']} consecutive challenges connection-failed "
+                        "after backoff retries (LLM provider appears down)"
                     )
                     logger.error(
                         "aborting run: %s. Remaining challenges will be skipped — "
@@ -531,7 +626,7 @@ def sync_dataset(client: Any, name: str, items: List[Dict[str, Any]], benchmark:
 # ---------------------------------------------------------------------------
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--benchmark", default="nyuctf")
-    p.add_argument("--split", default="development", choices=["development", "test"])
+    p.add_argument("--split", default="development", choices=["development", "test", "bandit", "krypton"])
     p.add_argument("--limit", type=int, default=None, help="cap number of challenges")
     p.add_argument("--challenge", action="append", dest="only", help="restrict to these challenge_id(s); repeatable")
     p.add_argument("--dataset-name", default=None, help="default: gencyber-<benchmark>-<split>")
@@ -634,7 +729,36 @@ def main() -> int:
         result = client.run_experiment(data=items, **common)
     else:
         sync_dataset(client, dataset_name, items, args.benchmark, args.split)
-        result = client.get_dataset(dataset_name).run_experiment(**common)
+        ds = client.get_dataset(dataset_name)
+        if args.only:
+            # A dataset-based ``run_experiment`` iterates ALL items in the dataset, so the
+            # ``--challenge`` filter (which only shrank the enumerated ``items`` used for the
+            # upsert above) would otherwise be silently ignored here — the whole dataset
+            # would run. Replicate what ``Dataset.run_experiment`` does internally
+            # (``client.run_experiment(data=dataset.items, _dataset_version=...)``) but over
+            # the filtered subset, so the run stays a proper, comparable dataset run while
+            # executing exactly the requested challenges.
+            only_set = set(args.only)
+            present = {_dataset_item_cid(it) for it in ds.items}
+            missing = only_set - present
+            if missing:
+                logger.warning(
+                    "--challenge id(s) not present in dataset '%s' (skipped): %s",
+                    dataset_name, ", ".join(sorted(missing)),
+                )
+            selected = [it for it in ds.items if _dataset_item_cid(it) in only_set]
+            if not selected:
+                logger.error("no dataset items matched --challenge; aborting.")
+                return 1
+            logger.info(
+                "running %d of %d dataset item(s) (filtered by --challenge)",
+                len(selected), len(ds.items),
+            )
+            result = client.run_experiment(
+                data=selected, _dataset_version=ds.version, **common
+            )
+        else:
+            result = ds.run_experiment(**common)
 
     try:
         print(result.format())

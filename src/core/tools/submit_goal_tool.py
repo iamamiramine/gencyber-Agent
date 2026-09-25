@@ -58,9 +58,22 @@ def looks_like_placeholder(candidate: str) -> bool:
     norm = (candidate or "").strip().lower()
     if not norm:
         return False  # empty is handled separately as "empty submission"
-    # Template markers — ellipsis / angle-bracket placeholders like ``flag{...}`` or ``<flag>``.
-    if "..." in norm or "<" in norm or ">" in norm:
+    # Template markers — angle-bracket placeholders like ``<flag>``.
+    if "<" in norm or ">" in norm:
         return True
+    # An ellipsis marks a template only when the value is essentially *made of*
+    # template punctuation. A bare ``in norm`` test rejects any real flag that
+    # happens to contain three dots, and 2023q-pwn-puffin is exactly that case: the
+    # agent recovered the correct 65-character flag, which ends ``...her....}``, and
+    # this guard classified it as a placeholder. That single false positive also
+    # recorded the value as rejected, so the duplicate blocker suppressed the next
+    # fourteen attempts — one misfire cost the whole solve. Require that stripping
+    # template punctuation leaves too little real content to be a flag.
+    if "..." in norm:
+        body = norm[norm.index("{") + 1:norm.rindex("}")] if "{" in norm and "}" in norm else norm
+        substantive = re.sub(r"[^a-z0-9]", "", body.replace(".", ""))
+        if len(substantive) < 8:
+            return True
     if norm in _PLACEHOLDER_EXACT:
         return True
     if any(sub in norm for sub in _PLACEHOLDER_SUBSTR):

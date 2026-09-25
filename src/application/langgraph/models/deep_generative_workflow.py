@@ -46,7 +46,13 @@ from deepagents.graph import DeepAgentState
 from langchain.agents.middleware.types import AgentMiddleware, hook_config
 
 from application.langgraph.helpers import memory_fold
-from application.langgraph.helpers.skills_helper import section_retrieval_enabled
+from application.langgraph.helpers.skills_helper import (
+    compose_subagent_prompt,
+    discover_ctf_skills,
+    make_read_skill_note_tool,
+    make_search_skill_tool,
+    section_retrieval_enabled,
+)
 from core.helpers.history_bound import select_messages_to_drop
 from core.tools.flag_shape import (
     classify_flag_candidate,
@@ -132,6 +138,62 @@ _flag_formats: Dict[str, Optional[str]] = {}
 # guesses and steer the model to verify a candidate against the challenge's own
 # checker/service before submitting. 0 disables the cap.
 _MAX_DISTINCT_FLAGS = int(os.getenv("GENCYBER_MAX_DISTINCT_FLAGS", "10"))
+
+
+# ---- skill scope (resource-matched monolith, M0/M1) -----------------------
+# The planner reaches the corpus through its specialists: each one is built over a
+# single ``ctf-*`` pack, so a specialist sees exactly one pack's SKILL.md index and
+# can lazily open only that pack's notes. A monolith has no specialists, so to be
+# resource-MATCHED rather than merely resource-comparable it must get the same
+# access: one pack, chosen by the challenge's category hint.
+#
+# Category-scoped (not all-category) is deliberate. All-category would hand the
+# monolith strictly more corpus than any single specialist ever sees, which makes a
+# planner win unfalsifiable ("your control had more information and still lost") and
+# a planner loss uninterpretable. Scoping to the hinted category means M and P differ
+# only in structure: persistent non-executing planner, delegation, transient
+# specialist contexts and evidence folding.
+_skill_scope: Dict[str, str] = {}              # session_id -> challenge category
+
+# Category hint as the benchmark reports it -> skill pack directory name. The NYU
+# dataset uses the short forms on the left; the corpus uses the ``ctf-*`` names on
+# the right. Unmapped categories leave the monolith with no pack, which is logged
+# rather than raised: a challenge in an uncovered category must still run, it just
+# has no matched corpus to withhold or grant.
+_CATEGORY_TO_PACK: Dict[str, str] = {
+    "crypto": "ctf-crypto",
+    "cry": "ctf-crypto",
+    "rev": "ctf-reverse",
+    "reverse": "ctf-reverse",
+    "pwn": "ctf-pwn",
+    "misc": "ctf-misc",
+    "msc": "ctf-misc",
+    "web": "ctf-web",
+    "forensics": "ctf-forensics",
+    "for": "ctf-forensics",
+    "osint": "ctf-osint",
+    "malware": "ctf-malware",
+    "ai-ml": "ctf-ai-ml",
+    "ai_ml": "ctf-ai-ml",
+}
+
+
+def set_skill_scope(session_id: Optional[str], *, category: Optional[str] = None) -> None:
+    """Record the challenge category for ``session_id`` (no-op on blank id/category).
+
+    Called from ``LangGraphService.init_workflow`` alongside
+    :func:`set_escalation_config`. Only the monolith build reads it; the planner
+    ignores it, because its specialists are already one-pack-per-agent.
+    """
+    if not session_id or category is None:
+        return
+    cat = str(category).strip().lower()
+    if cat:
+        _skill_scope[session_id] = cat
+
+
+def _pack_for_session(session_id: Optional[str]) -> Optional[str]:
+    return _CATEGORY_TO_PACK.get(_skill_scope.get(session_id or "", ""))
 
 
 def _reset_submission_tracking(session_id: str) -> None:
@@ -690,6 +752,24 @@ def _make_tools(
         # read-only inspection indefinitely instead of acting on output it already
         # has. The prior output is still in the message history, so we point back to
         # it and force a different next action instead of hitting the PTY again.
+        # The budget is charged BEFORE the guards, because a guard-blocked call still
+        # costs a model turn and therefore still costs money. Charging it after meant a
+        # duplicate-spamming run spent its turns without ever advancing the counter:
+        # measured 394 of 570 calls duplicate-blocked, so only ~176 of a 340 budget was
+        # ever charged and the graph recursion limit ended the run instead. That breaks
+        # the M/P match, since the two topologies spam duplicates at different rates and
+        # recursion would then bind them at different real-action counts.
+        sid = state.get("session_id") or session_id
+        if _step_budget_exhausted(sid):
+            print("EXECUTE_SCRIPT_TOOL[blocked-step-budget]", flush=True)
+            return Command(
+                update={
+                    "command": None,
+                    "messages": [ToolMessage(_STEP_BUDGET_TOOL_MSG, tool_call_id=tool_call_id)],
+                }
+            )
+        _bump_step_budget(sid)
+
         command_norm = _normalize_command(command)
         prior_runs = _count_prior_executions(
             state.get("messages") or [], command_norm, tool_call_id
@@ -716,16 +796,6 @@ def _make_tools(
                     "messages": [ToolMessage(warn, tool_call_id=tool_call_id)],
                 }
             )
-        sid = state.get("session_id") or session_id
-        if _step_budget_exhausted(sid):
-            print("EXECUTE_SCRIPT_TOOL[blocked-step-budget]", flush=True)
-            return Command(
-                update={
-                    "command": None,
-                    "messages": [ToolMessage(_STEP_BUDGET_TOOL_MSG, tool_call_id=tool_call_id)],
-                }
-            )
-        _bump_step_budget(sid)
         result = execute_script_tool.invoke({"command": command}) or {}
         out = result.get("script_output") or ""
         # Record the command alongside its output so the accumulated evidence reads
@@ -767,6 +837,18 @@ def _make_tools(
         prior_writes = _count_prior_writes(
             state.get("messages") or [], content, tool_call_id
         )
+        # Charged before the guards: a guard-blocked write still costs a model turn.
+        sid = state.get("session_id") or session_id
+        if _step_budget_exhausted(sid):
+            print("WRITE_SCRIPT_TOOL[blocked-step-budget]", flush=True)
+            return Command(
+                update={
+                    "write_script": None,
+                    "messages": [ToolMessage(_STEP_BUDGET_TOOL_MSG, tool_call_id=tool_call_id)],
+                }
+            )
+        _bump_step_budget(sid)
+
         if prior_writes >= _MAX_IDENTICAL_WRITES:
             warn = (
                 f"[DUPLICATE SCRIPT BLOCKED] You have already saved this exact script "
@@ -798,16 +880,6 @@ def _make_tools(
                         "messages": [ToolMessage(gate_msg, tool_call_id=tool_call_id)],
                     }
                 )
-        sid = state.get("session_id") or session_id
-        if _step_budget_exhausted(sid):
-            print("WRITE_SCRIPT_TOOL[blocked-step-budget]", flush=True)
-            return Command(
-                update={
-                    "write_script": None,
-                    "messages": [ToolMessage(_STEP_BUDGET_TOOL_MSG, tool_call_id=tool_call_id)],
-                }
-            )
-        _bump_step_budget(sid)
         result = (
             write_script_tool.invoke(
                 {"write_script": content, "write_script_language": language}
@@ -839,6 +911,11 @@ def _make_tools(
     ) -> Command:
         """Submit the recovered final answer for validation. Returns whether it was accepted or rejected (with a reason). Only call this with a value you actually recovered from real tool output."""
         sid = state.get("session_id") or session_id
+        # Charged up front so a guard-blocked submission still costs budget: it costs a
+        # model turn either way. Never short-circuited on the budget, though —
+        # validation is cheap and an accepted flag is the win condition, which must not
+        # be refused on a budget boundary. StepBudgetMiddleware ends the run after.
+        _bump_step_budget(sid)
         # Loop-breaker: never re-validate a flag already rejected this run. A weak
         # model otherwise re-submits an IDENTICAL rejected value many times (28x
         # observed), burning the whole budget. A value already known wrong cannot
@@ -969,10 +1046,6 @@ def _make_tools(
                         "messages": [ToolMessage(gate_msg, tool_call_id=tool_call_id)],
                     }
                 )
-        # Count the submission attempt toward the action budget, but never short-circuit
-        # it: validation is cheap and an accepted flag is the win condition we must not
-        # reject on a budget boundary. StepBudgetMiddleware ends the run afterward.
-        _bump_step_budget(sid)
         # Per-run diagnostics for the eval harness (real attempt counting).
         _record_submission_attempt(sid, flag)
         result = (
@@ -1814,6 +1887,43 @@ class DeepGenerativeWorkflow:
         return create_deep_agent(**kwargs)
 
     @classmethod
+    def _attach_skill_scope(
+        cls,
+        tools: List[Any],
+        system_prompt: str,
+        session_id: Optional[str],
+    ) -> tuple:
+        """Give the monolith the SAME corpus access one planner specialist has.
+
+        A specialist is built over exactly one ``ctf-*`` pack: that pack's SKILL.md is
+        its system-prompt index, and ``read_skill_note`` is sandboxed to that pack's
+        notes. To be resource-MATCHED the monolith needs both halves, scoped by the
+        challenge's category hint (:func:`set_skill_scope`).
+
+        Both halves matter and for different reasons. Without the tool the monolith
+        cannot reach the corpus at all, so a planner win would partly be a corpus win.
+        Without the SKILL.md index it can reach the corpus but does not know what is in
+        it, which is a subtler version of the same confound.
+
+        Returns ``(tools, system_prompt)`` unchanged when no category was recorded, so
+        non-benchmark runs and the baseline registry are unaffected.
+        """
+        pack = _pack_for_session(session_id)
+        if not pack:
+            logger.info("monolith skill scope: none (no category hint for this run)")
+            return tools, system_prompt
+        skill = next((s for s in discover_ctf_skills() if s.name == pack), None)
+        if skill is None:
+            logger.warning("monolith skill scope %s not found in corpus", pack)
+            return tools, system_prompt
+        tools = list(tools)
+        tools.append(make_read_skill_note_tool(skill.skill_dir, skill.notes))
+        if section_retrieval_enabled():
+            tools.append(make_search_skill_tool(skill.skill_dir, skill.notes))
+        logger.info("monolith skill scope: %s (%d notes)", pack, len(skill.notes))
+        return tools, compose_subagent_prompt(system_prompt, skill)
+
+    @classmethod
     def build(
         cls,
         *,
@@ -1838,6 +1948,17 @@ class DeepGenerativeWorkflow:
         )
         tools.append(_make_recall_tool(session_id))
 
+        tools, system_prompt = cls._attach_skill_scope(tools, system_prompt, session_id)
+
+        # ---- escalation parity (M1) ----
+        # Identical sticky ladder to a specialist's: same trigger (placeholder
+        # submission, rejected submission, or the action threshold), same strong model,
+        # same per-episode stickiness. ``build_escalation_model`` returns None when the
+        # run set ``--escalation-model off``, which is exactly M0 — so M0 and M1 differ
+        # by the runner flag alone, not by a code path.
+        strong_model = build_escalation_model(agent, session_id=session_id)
+        extra_middleware = [EscalationMiddleware(session_id, strong_model)]
+
         mongo_client = get_mongodb_client()
         db_name = os.getenv("MONGODB_DATABASE", "gencyber")
         checkpointer = MongoDBSaver(mongo_client, db_name=db_name)
@@ -1848,6 +1969,7 @@ class DeepGenerativeWorkflow:
             tools=tools,
             checkpointer=checkpointer,
             session_id=session_id,
+            extra_middleware=extra_middleware,
         )
         return cls(session_id, graph=compiled)
 

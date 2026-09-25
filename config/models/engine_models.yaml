@@ -20,14 +20,25 @@ default_base_url: http://gencyber-engine:8000/v1
 models:
   # ── Orchestrator / escalation tier (big; primary engine instance) ─────────────
   # vLLM tool-call parser: hermes (Qwen), gemma4 (Gemma) — set in the engine .env.
-  - Qwen/Qwen3.6-27B                 # Qwen orchestrator (dense 27B), parser=hermes
+  # Qwen orchestrator (dense 27B), parser=hermes + reasoning-parser qwen3.
+  # Explicit base_url = RunPod direct-TCP endpoint (per-model base_url wins over the
+  # catalog default_base_url, which points at the local docker engine and is wrong here).
+  - name: Qwen/Qwen3.6-27B
+    base_url: http://38.128.232.45:20871/v1
   - google/gemma-4-31B-it            # Gemma orchestrator (dense 31B), parser=gemma4
 
   # ── Subagent tier (small; second engine instance) ────────────────────────────
-  - name: Qwen/Qwen3-8B              # Qwen subagent (dense 8B), parser=hermes
-    base_url: http://gencyber-engine-sub:8000/v1
+  - name: Qwen/Qwen3-8B              # served on RunPod (vLLM) via direct TCP endpoint
+    base_url: http://38.128.232.45:42775/v1
   - name: google/gemma-4-12B-it      # Gemma subagent (12B), parser=gemma4
     base_url: http://gencyber-engine-sub:8000/v1
+
+  # ── RunPod single-pod deploy (Qwen3-Coder, FP8) ──────────────────────────────
+  # Explicit base_url = direct TCP endpoint (bypasses the *.proxy.runpod.net HTTP
+  # proxy whose idle/stream timeout dropped long subagent prefills mid-stream).
+  # Per-model base_url wins over the catalog default_base_url. vLLM parser: qwen3_xml.
+  - name: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+    base_url: http://38.128.232.45:24248/v1
 
   # ── Small Qwen for a single-GPU / laptop smoke test (primary instance) ────────
   - Qwen/Qwen2.5-1.5B-Instruct
